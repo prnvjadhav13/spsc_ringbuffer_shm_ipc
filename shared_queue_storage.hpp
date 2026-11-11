@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Ahmad Jadhav. All rights reserved.
+// This software is provided solely for educational purposes.
+// See the repository LICENSE file for reuse terms.
+
 #ifndef _SHARED_QUEUE_STORAGE_HPP
 #define _SHARED_QUEUE_STORAGE_HPP
 

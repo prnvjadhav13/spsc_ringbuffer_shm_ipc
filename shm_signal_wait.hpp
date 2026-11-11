@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Ahmad Jadhav. All rights reserved.
+// This software is provided solely for educational purposes.
+// See the repository LICENSE file for reuse terms.
+
 #ifndef _SHM_SIGNAL_WAIT_HPP
 #define _SHM_SIGNAL_WAIT_HPP
 

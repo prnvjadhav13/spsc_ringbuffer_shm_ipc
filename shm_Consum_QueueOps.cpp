@@ -6,60 +6,40 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 
-#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "log_queue_config.hpp"
 #include "shm_log_queue_mapping.hpp"
 #include "shm_queue_eventfd.hpp"
-
-#define EPOLL_EVENT_QUEUE 1
-#define EPOLL_EVENT_SIGNAL 2
+#include "transfer_stats.hpp"
 
 namespace {
 
-// View a fixed-size text field up to its first null character or capacity.
-std::string_view bounded_text(const char* text, std::size_t capacity) {
-  const auto* end = std::find(text, text + capacity, '\0');
-  return {text, static_cast<std::size_t>(end - text)};
-}
+constexpr std::uint32_t kEpollEventQueue = 1;
+constexpr std::uint32_t kEpollEventSignal = 2;
+constexpr char kHexDigits[] = "0123456789abcdef";
+constexpr std::size_t kPayloadWriterQueueCapacity = kLogQueueCapacity / 2;
 
-// Convert a log severity to its printable name, with a fallback for unknown values.
-const char* level_name(Level level) {
-  switch (level) {
-    case Level::DEBUG:
-      return "DEBUG";
-    case Level::INFO:
-      return "INFO";
-    case Level::WARN:
-      return "WARN";
-    case Level::ERROR:
-      return "ERROR";
-    case Level::CRITICAL:
-      return "CRITICAL";
-    case Level::FATAL:
-      return "FATAL";
-  }
-  return "UNKNOWN";
-}
-
-// Format one log record into the supplied output stream using bounded text fields.
-void write_event(std::ostream& output, const LogEvent& event) {
-  output << event.LogEventId << ". IP: " << bounded_text(event.ip, sizeof(event.ip))
-         << " | Level: " << level_name(event.level)
-         << " | Message: " << bounded_text(event.message, sizeof(event.message)) << '\n';
-}
-
-// Read one pending signal from signalfd; return zero when none is available.
 int read_signal(int signal_fd) {
   signalfd_siginfo signal_info{};
   for (;;) {
@@ -80,27 +60,171 @@ int read_signal(int signal_fd) {
   }
 }
 
-// Name the supported shutdown signals: SIGINT and SIGTERM.
-const char* signal_name(int signal_number) {
-  return signal_number == SIGINT ? "SIGINT" : "SIGTERM";
+void write_payload_hex(std::ostream& output, const LogEvent& message,
+                       std::string& encoded_payload) {
+  encoded_payload.clear();
+  encoded_payload.append(std::to_string(message.LogEventId));
+  encoded_payload.push_back(':');
+  encoded_payload.append(std::to_string(message.message_length));
+  encoded_payload.append(": [");
+  for (std::size_t i = 0; i < message.message_length; ++i) {
+    const unsigned char byte = std::to_integer<unsigned char>(message.payload[i]);
+    encoded_payload.push_back(kHexDigits[byte >> 4]);
+    encoded_payload.push_back(kHexDigits[byte & 0x0F]);
+  }
+  encoded_payload.append("]\n");
+  output.write(encoded_payload.data(), static_cast<std::streamsize>(encoded_payload.size()));
 }
 
-// Report the signal that interrupted startup and return its conventional exit status.
-int exit_after_startup_signal(int signal_fd) {
-  const int signal_number = read_signal(signal_fd);
-  if (signal_number == 0) {
-    throw std::runtime_error("Startup wait ended without a signal");
+class BoundedLogEventQueue {
+ public:
+  explicit BoundedLogEventQueue(std::size_t capacity) : slots_(capacity) {}
+
+  bool push(const LogEvent& message) {
+    std::unique_lock lock(mutex_);
+    queue_not_full_.wait(lock, [this] { return count_ < slots_.size() || closed_; });
+    if (closed_) {
+      return false;
+    }
+
+    slots_[write_index_] = message;
+    write_index_ = (write_index_ + 1) % slots_.size();
+    ++count_;
+    lock.unlock();
+    queue_not_empty_.notify_one();
+    return true;
   }
-  std::cout << "Received " << signal_name(signal_number) << "; consumer shutting down.\n";
-  return 128 + signal_number;
+
+  const LogEvent* front() {
+    std::unique_lock lock(mutex_);
+    queue_not_empty_.wait(lock, [this] { return count_ != 0 || closed_; });
+    // Keep this slot occupied until pop_front while the writer reads it unlocked.
+    return count_ == 0 ? nullptr : &slots_[read_index_];
+  }
+
+  void pop_front() {
+    {
+      std::lock_guard lock(mutex_);
+      read_index_ = (read_index_ + 1) % slots_.size();
+      --count_;
+    }
+    queue_not_full_.notify_one();
+  }
+
+  void close() {
+    {
+      std::lock_guard lock(mutex_);
+      closed_ = true;
+    }
+    queue_not_empty_.notify_all();
+    queue_not_full_.notify_all();
+  }
+
+  bool is_empty() {
+    std::lock_guard lock(mutex_);
+    return count_ == 0;
+  }
+
+ private:
+  std::vector<LogEvent> slots_;
+  std::mutex mutex_;
+  std::condition_variable queue_not_empty_;
+  std::condition_variable queue_not_full_;
+  std::size_t read_index_{};
+  std::size_t write_index_{};
+  std::size_t count_{};
+  bool closed_{};
+};
+
+class PayloadWriterThread {
+ public:
+  PayloadWriterThread(BoundedLogEventQueue& queue, std::thread thread)
+      : queue_(queue), thread_(std::move(thread)) {}
+
+  ~PayloadWriterThread() { finish(); }
+
+  void finish() {
+    queue_.close();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+ private:
+  BoundedLogEventQueue& queue_;
+  std::thread thread_;
+};
+
+void payload_writer_thread(BoundedLogEventQueue& queue, std::ostream& output,
+                           const char* output_path, std::string& encoded_payload,
+                           std::atomic<bool>& output_ok, std::exception_ptr& writer_error) {
+  bool writer_failed = false;
+  while (const LogEvent* message = queue.front()) {
+    if (!writer_failed && output_ok.load(std::memory_order_relaxed)) {
+      try {
+        write_payload_hex(output, *message, encoded_payload);
+        if (!output) {
+          throw std::runtime_error(std::string("Failed while writing payload data to: ") +
+                                   output_path);
+        }
+      } catch (...) {
+        writer_error = std::current_exception();
+        writer_failed = true;
+        output_ok.store(false, std::memory_order_relaxed);
+      }
+    }
+    queue.pop_front();
+  }
+
+  if (!writer_failed) {
+    try {
+      output.flush();
+      if (!output) {
+        throw std::runtime_error(std::string("Failed to flush payload output file: ") +
+                                 output_path);
+      }
+    } catch (...) {
+      writer_error = std::current_exception();
+      output_ok.store(false, std::memory_order_relaxed);
+    }
+  }
+}
+
+void print_consumer_help(const char* program) {
+  std::cout << "Usage: " << program << " --file-path output-file [--help]\n\n"
+            << "  --file-path output-file  Required destination for received payloads "
+               "(event-id:length: [hex payload], one per line).\n"
+            << "  --help                   Show this help.\n";
 }
 
 }  // namespace
 
-// Attach to the shared queue, drain notified records to console and file, and handle shutdown.
+// Drain payload messages into a bounded writer queue and report transfer totals.
 int main(int argc, char* argv[]) {
-  if (argc > 2) {
-    std::cerr << "Usage: " << argv[0] << " [output-file]\n";
+  const char* output_path = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view argument(argv[i]);
+    if (argument == "--help" || argument == "-h") {
+      print_consumer_help(argv[0]);
+      return 0;
+    }
+    if (argument != "--file-path") {
+      std::cerr << "Unknown argument: " << argument << '\n';
+      print_consumer_help(argv[0]);
+      return 2;
+    }
+    if (output_path != nullptr) {
+      std::cerr << "Option specified more than once: --file-path.\n";
+      return 2;
+    }
+    if (i + 1 >= argc || std::string_view(argv[i + 1]).starts_with('-')) {
+      std::cerr << "Missing value for --file-path.\n";
+      return 2;
+    }
+    output_path = argv[++i];
+  }
+  if (output_path == nullptr) {
+    std::cerr << "Missing required option: --file-path.\n";
     return 2;
   }
 
@@ -108,7 +232,6 @@ int main(int argc, char* argv[]) {
   sigemptyset(&stop_signals);
   sigaddset(&stop_signals, SIGINT);
   sigaddset(&stop_signals, SIGTERM);
-  // Block these signals so the consumer can read them from signalfd.
   const int mask_result = pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
   if (mask_result != 0) {
     std::cerr << "pthread_sigmask failed: " << std::strerror(mask_result) << '\n';
@@ -121,27 +244,24 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  const char* output_path = argc == 2 ? argv[1] : kConsumerFilePath;
-  std::ofstream log_file(output_path, std::ios::out | std::ios::app);
-  if (!log_file) {
-    std::cerr << "Could not open log output file: " << output_path << '\n';
+  std::ofstream output_file(output_path, std::ios::out | std::ios::trunc);
+  if (!output_file) {
+    std::cerr << "Could not open payload output file: " << output_path << '\n';
     return 1;
   }
 
   try {
     SharedLogQueueMapping<LogEvent, kLogQueueCapacity> mapping;
-    std::cout << "Waiting for producer to create shared memory...\n" << std::flush;
     if (!mapping.open_shared_memory_ring_buffer(signal_fd.get())) {
-      return exit_after_startup_signal(signal_fd.get());
+      return 128 + read_signal(signal_fd.get());
     }
-    std::cout << "Shared memory mapped; waiting for producer initialization...\n" << std::flush;
     if (!mapping.wait_until_ready(signal_fd.get())) {
-      return exit_after_startup_signal(signal_fd.get());
+      return 128 + read_signal(signal_fd.get());
     }
 
     auto notification_fds = SharedQueueEventFd::receive(signal_fd.get());
     if (!notification_fds.queue_ready || !notification_fds.space_available) {
-      return exit_after_startup_signal(signal_fd.get());
+      return 1;
     }
 
     UniqueFileDescriptor epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
@@ -150,30 +270,38 @@ int main(int argc, char* argv[]) {
     }
     epoll_event queue_event{};
     queue_event.events = EPOLLIN;
-    // data.u32 identifies which registered descriptor epoll_wait reports.
-    queue_event.data.u32 = EPOLL_EVENT_QUEUE;
+    queue_event.data.u32 = kEpollEventQueue;
     if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, notification_fds.queue_ready.get(),
                     &queue_event) == -1) {
       throw std::system_error(errno, std::generic_category(), "epoll_ctl add queue eventfd");
     }
     epoll_event signal_event{};
     signal_event.events = EPOLLIN;
-    signal_event.data.u32 = EPOLL_EVENT_SIGNAL;
+    signal_event.data.u32 = kEpollEventSignal;
     if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, signal_fd.get(), &signal_event) == -1) {
       throw std::system_error(errno, std::generic_category(), "epoll_ctl add signalfd");
     }
 
-    std::size_t events_written = 0;
-    bool output_ok = true;
+    BoundedLogEventQueue writer_queue(kPayloadWriterQueueCapacity);
+    std::string encoded_payload;
+    encoded_payload.reserve(2 * kLogMessageSize + 64);
+    std::atomic<bool> output_ok{true};
+    std::exception_ptr writer_error;
+    std::thread writer(payload_writer_thread, std::ref(writer_queue), std::ref(output_file),
+                       output_path, std::ref(encoded_payload), std::ref(output_ok),
+                       std::ref(writer_error));
+    PayloadWriterThread writer_thread(writer_queue, std::move(writer));
+
+    const auto transfer_start = std::chrono::steady_clock::now();
+    std::size_t messages_received = 0;
+    std::uint64_t payload_total_bytes = 0;
     int received_signal = 0;
-    bool queue_notified = false;
-    bool signal_notified = false;
+    std::chrono::steady_clock::time_point ring_drain_end;
 
     while (true) {
       std::array<epoll_event, 2> ready_events{};
-      std::cout << "Consumer is pausing at lower Queue watermark: " << mapping.queue_size() << '\n';
-      const int ready_count = ::epoll_wait(epoll_fd.get(), ready_events.data(),
-                                           static_cast<int>(ready_events.size()), -1);
+      const int ready_count =
+          ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), -1);
       if (ready_count == -1) {
         if (errno == EINTR) {
           continue;
@@ -181,76 +309,104 @@ int main(int argc, char* argv[]) {
         throw std::system_error(errno, std::generic_category(), "epoll_wait");
       }
 
+      bool queue_notified = false;
       for (int i = 0; i < ready_count; ++i) {
-        queue_notified |= ready_events[i].data.u32 == EPOLL_EVENT_QUEUE;
-        signal_notified |= ready_events[i].data.u32 == EPOLL_EVENT_SIGNAL;
-      }
-      if (signal_notified) {
-        received_signal = read_signal(signal_fd.get());
-        if (received_signal != 0) {
-          std::cout << "Received " << signal_name(received_signal)
-                    << "; draining queued events before shutdown.\n";
-          // Treat the signal as a queue wake-up to drain records already enqueued.
+        if (ready_events[i].data.u32 == kEpollEventQueue) {
+          queue_notified = true;
+        } else if (ready_events[i].data.u32 == kEpollEventSignal) {
+          received_signal = read_signal(signal_fd.get());
           queue_notified = true;
         }
       }
+      if (!queue_notified) {
+        continue;
+      }
 
-      if (queue_notified) {
-        std::cout << "Consumer is waking up due to data in Queue: " << mapping.queue_size()
-                  << std::endl;
-        const int drain_error = drain_eventfd(notification_fds.queue_ready.get());
-        queue_notified = false;
-        if (drain_error != 0) {
-          std::cerr << "Queue notification drain failed: " << std::strerror(-drain_error) << ".\n";
-          return 1;
-        }
-        LogEvent event{};
-        while (mapping.dequeue(event)) {
-          const std::size_t queue_size = mapping.queue_size();
+      const int drain_error = drain_eventfd(notification_fds.queue_ready.get());
+      if (drain_error != 0) {
+        throw std::system_error(-drain_error, std::generic_category(),
+                                "drain queue notification");
+      }
 
-          if ((queue_size != 0) && queue_size <= kLogQueueLowWatermark) {
-            const int notify_error = notify_eventfd(notification_fds.space_available.get());
-            if (notify_error != 0) {
-              std::cerr << "Space-available notification failed: " << std::strerror(-notify_error)
-                        << ".\n";
-              output_ok = false;
-            }
-          }
-
-          if (output_ok) {
-            write_event(std::cout, event);
-            write_event(log_file, event);
-            if (!std::cout || !log_file) {
-              std::cerr << "Failed while writing a log event to the console or file.\n";
-              output_ok = false;
-            } else {
-              ++events_written;
+      LogEvent message{};
+      while (mapping.dequeue(message)) {
+        const std::size_t queue_size = mapping.queue_size();
+        if (message.message_length == 0 || message.message_length > kLogMessageSize) {
+          std::cerr << "Received invalid payload length: " << message.message_length << ".\n";
+          output_ok.store(false, std::memory_order_relaxed);
+        } else {
+          if (message.message_length >
+              std::numeric_limits<std::uint64_t>::max() - payload_total_bytes) {
+            std::cerr << "Payload byte total exceeds the supported range.\n";
+            output_ok.store(false, std::memory_order_relaxed);
+          } else {
+            ++messages_received;
+            payload_total_bytes += message.message_length;
+            if (!writer_queue.push(message)) {
+              throw std::runtime_error("Payload writer queue closed before transfer completed");
             }
           }
         }
 
-        if (mapping.producer_done() && mapping.queue_size() == 0) {
-          break;
+        if (queue_size != 0 && queue_size <= kLogQueueLowWatermark) {
+          const int notify_error = notify_eventfd(notification_fds.space_available.get());
+          if (notify_error != 0) {
+            std::cerr << "Space-available notification failed: " << std::strerror(-notify_error)
+                      << ".\n";
+            output_ok.store(false, std::memory_order_relaxed);
+          }
         }
       }
-      if (received_signal != 0) {
+
+      if (mapping.producer_done() && mapping.queue_size() == 0) {
+        ring_drain_end = std::chrono::steady_clock::now();
+        mapping.mark_consumer_done();
+        const int notify_error = notify_eventfd(notification_fds.space_available.get());
+        if (notify_error != 0) {
+          std::cerr << "Consumer-completion notification failed: "
+                    << std::strerror(-notify_error) << ".\n";
+          output_ok.store(false, std::memory_order_relaxed);
+        }
+        writer_thread.finish();
         break;
       }
     }
 
-    log_file.flush();
-    if (!log_file) {
-      std::cerr << "Failed to flush log output file: " << output_path << '\n';
-      output_ok = false;
+    const double elapsed_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - transfer_start).count();
+    const double ring_drain_elapsed_seconds =
+        std::chrono::duration<double>(ring_drain_end - transfer_start).count();
+    const double bytes_per_second =
+        elapsed_seconds > 0.0 ? static_cast<double>(payload_total_bytes) / elapsed_seconds : 0.0;
+    const double ring_drain_bytes_per_second =
+        ring_drain_elapsed_seconds > 0.0
+            ? static_cast<double>(payload_total_bytes) / ring_drain_elapsed_seconds
+            : 0.0;
+    if (writer_error) {
+      try {
+        std::rethrow_exception(writer_error);
+      } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+      } catch (...) {
+        std::cerr << "Payload writer failed with an unknown error.\n";
+      }
     }
-    if (output_ok) {
-      std::cout << "Wrote " << events_written << " events to " << output_path << ".\n";
-    }
+    std::cout << "Consumer transfer summary:\n"
+              << "  total_messages_received=" << messages_received << "\n"
+              << "  total_payload_bytes_received=" << payload_total_bytes << " ["
+              << format_byte_size(payload_total_bytes) << "]\n"
+              << "  ring_drain_elapsed_seconds=" << ring_drain_elapsed_seconds << "\n"
+              << "  ring_drain_transfer_rate_bytes_per_second=" << std::fixed
+              << std::setprecision(1) << ring_drain_bytes_per_second << " ["
+              << format_byte_rate(ring_drain_bytes_per_second) << "]\n"
+              << std::defaultfloat << std::setprecision(6)
+              << "  total_elapsed_time_seconds=" << elapsed_seconds << "\n"
+              << "  transfer_rate_bytes_per_second=" << std::fixed << std::setprecision(1)
+              << bytes_per_second << " [" << format_byte_rate(bytes_per_second) << "]\n";
 
-    if (received_signal != 0) {
-      std::cout << "Consumer stopped by " << signal_name(received_signal) << ".\n";
-    }
-    return output_ok ? (received_signal == 0 ? 0 : 128 + received_signal) : 1;
+    return output_ok.load(std::memory_order_relaxed)
+               ? (received_signal == 0 ? 0 : 128 + received_signal)
+               : 1;
   } catch (const std::exception& error) {
     std::cerr << "Consumer setup or runtime failed: " << error.what() << '\n';
     return 1;

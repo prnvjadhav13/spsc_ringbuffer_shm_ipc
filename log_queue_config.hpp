@@ -19,25 +19,21 @@ inline constexpr std::size_t kLogQueueHighWatermark =
     (kLogQueueCapacity * 90) / 100;
 inline constexpr std::size_t kLogQueueLowWatermark =
     (kLogQueueCapacity * 40) / 100;
-inline constexpr const char kConsumerFilePath[] = "consumer_logs.out";
+inline constexpr std::size_t kDefaultTransferMessages = 1'000;
 
-inline constexpr std::size_t kLogIpSize = 129;
-inline constexpr std::size_t kLogMessageSize = 1024;
-
-enum class Level : std::uint32_t {
-    DEBUG = 0,
-    INFO,
-    WARN,
-    ERROR,
-    CRITICAL,
-    FATAL
-};
+inline constexpr std::size_t kMinimumPayloadBytes = 1024;
+inline constexpr std::size_t kLogMessageSize = 2024; // 2 KiB
+static_assert(kMinimumPayloadBytes <= kLogMessageSize);
 
 struct LogEvent {
     std::size_t LogEventId{};
-    char ip[kLogIpSize]{};
-    Level level{Level::INFO};
-    char message[kLogMessageSize]{};
+    std::size_t message_length{0};
+    std::byte payload[kLogMessageSize]{};
+};
+
+struct TransferOptions {
+    std::size_t messages{kDefaultTransferMessages};
+    std::size_t payload_bytes{};
 };
 
 static_assert(std::is_trivially_copyable_v<LogEvent>,

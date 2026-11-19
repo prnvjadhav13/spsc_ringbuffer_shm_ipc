@@ -13,10 +13,10 @@
 #include "spsc_ringbuffer.hpp"
 
 inline constexpr std::uint64_t kSharedQueueMagic = 0x5348515545554531ULL;
-inline constexpr std::uint32_t kSharedQueueVersion = 2;
+inline constexpr std::uint32_t kSharedQueueVersion = 4;
 
 // In-place shared-memory layout for one SPSC queue. It stores compatibility
-// metadata, the ring buffer, and producer status flags; it owns no OS handles
+// metadata, the ring buffer, and endpoint status flags; it owns no OS handles
 // and performs no mapping or cleanup itself.
 template <typename T, std::size_t Capacity>
 struct SharedQueueStorage {
@@ -31,6 +31,7 @@ struct SharedQueueStorage {
   std::uint64_t message_alignment{alignof(T)};
   SpscRingBuffer<T, Capacity> ring;
   std::atomic<bool> producer_done{false};
+  std::atomic<bool> consumer_done{false};
 };
 
 static_assert(std::atomic<bool>::is_always_lock_free,

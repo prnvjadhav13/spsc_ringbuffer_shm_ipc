@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -18,6 +19,11 @@
 inline bool wait_for_signal_or_timeout(int signal_fd, std::chrono::milliseconds timeout) {
   if (signal_fd < 0) {
     throw std::invalid_argument("signalfd must be a valid file descriptor");
+  }
+
+  if (timeout.count() < std::numeric_limits<int>::min() ||
+      timeout.count() > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("poll timeout does not fit in an int");
   }
 
   pollfd descriptor{signal_fd, POLLIN, 0};

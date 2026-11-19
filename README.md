@@ -10,12 +10,12 @@ record into the ring, the consumer copies it out, and the consumer writes it
 to its output stream. `mmap`, `eventfd`, and the initial descriptor handoff
 still use Linux kernel facilities.
 
-The sample uses generated log events to show the full producer-to-consumer
-flow. It is an educational starting point for Linux applications that need
-low-overhead IPC; it is not a benchmark or a guarantee that shared memory will
-outperform other IPC for every workload. Measure with representative message
-sizes, rates, and consumer behavior before choosing an IPC mechanism for a
-production system.
+The sample transfers random payload messages to show the full
+producer-to-consumer flow. It is an educational starting point for Linux
+applications that need low-overhead IPC; it is not a benchmark or a guarantee
+that shared memory will outperform other IPC for every workload. Measure with
+representative message sizes, rates, and consumer behavior before choosing an
+IPC mechanism for a production system.
 
 ## What the sample does
 
@@ -26,26 +26,26 @@ production system.
 - `SpscRingBuffer<T, Capacity>` uses atomic head and tail indices with
   acquire/release ordering. It has one writer on each side and does not use a
   mutex. Its atomic types are required to be lock-free by compile-time checks.
-- The fixed-size `LogEvent` record contains an event ID, IP address, severity,
-  and message. The example queue holds 2,048 records.
+- Each fixed-size queue record contains a payload length and up to 1 MiB of
+  random payload data. The example queue holds 2,048 records.
 - After a successful enqueue, the producer signals a nonblocking `eventfd`.
   The consumer waits for that descriptor with level-triggered `epoll`, drains
   the notification, then dequeues records until the ring is empty. Eventfd
   notifications can coalesce; the ring's state, not the eventfd count, is the
   source of truth for available records.
-- The consumer prints records and appends them to `consumer_logs.out` by
-  default. Pass an output path as the consumer's optional argument to select a
-  different file.
+- The consumer drains payloads into a bounded in-process queue. A dedicated
+  writer thread converts them to hexadecimal lines in the required
+  `--file-path` output, allowing ring draining to proceed while file output is
+  in progress. Payload data is not printed to the console.
 - When queue occupancy reaches the 90% high watermark, the producer pauses.
   As the consumer drains the queue through the 40% low watermark, it signals a
   second eventfd. The producer waits for that notification with `epoll` and
   rechecks queue occupancy before resuming. This high/low watermark policy
   applies backpressure instead of allowing an unbounded queue to grow.
-- The producer also watches a `signalfd` and a one-shot 20-second timer in its
-  event loop. It stops on SIGINT, SIGTERM, or timeout, marks the queue as
-  complete, and notifies the consumer so it can drain remaining records and
-  exit. The consumer handles SIGINT/SIGTERM through its own `signalfd`, drains
-  queued records, flushes the output file, and then exits.
+- The producer sends a fixed number of messages, marks the queue complete, and
+  waits for the consumer to drain the shared-memory ring. The consumer flushes
+  queued file output before exiting and reports both ring-drain and total
+  throughput.
 
 The producer creates both eventfds. For initial setup only, it passes them to
 the consumer using `SCM_RIGHTS` over a local abstract Unix-domain socket. This
@@ -53,7 +53,7 @@ small control-plane handoff does not carry log records; the data plane remains
 the shared-memory ring. A larger event-driven producer can register the
 space-available eventfd alongside its other descriptors in the same `epoll`
 loop. In this sample, the producer has no separate input or TLS work to service
-while paused, so it waits for queue space, signals, or its timer.
+while paused, so it waits for queue-space notifications or shutdown signals.
 
 ## Run it
 
@@ -74,19 +74,59 @@ make debug
 ```
 
 Start the consumer and producer in separate terminals, from the repository
-root. The consumer waits for the producer to create and initialize the queue:
+root. The consumer waits for the producer to create and initialize the queue.
+Its output file is required:
 
 ```sh
-./build/release/consumer
+./build/release/consumer --file-path payloads.hex
 ./build/release/producer
 ```
 
-The default consumer output file is `consumer_logs.out` in its current working
-directory. To choose another file:
+The producer sends 1,000 messages by default. Payload contents are random and
+payload lengths are randomized from 1 KiB through 1 MiB. The output uses two
+hexadecimal characters per payload byte, so this default run can write about
+1.05 GB to the output file. Use `--messages` to change the message count or
+`--payload-bytes` to use a fixed payload length (1 through 1,048,576 bytes):
 
 ```sh
-./build/release/consumer /tmp/sample-logs.out
+./build/release/producer --messages 100 --payload-bytes 4096
 ```
+
+`--messages` must be positive. If `--payload-bytes` is omitted, each message
+gets a random payload length from 1,024 through 1,048,576 bytes. The consumer
+requires `--file-path` and truncates the named output file before writing lines
+in `event-id:length: [hex-payload]` format.
+
+CLI help is available at both endpoints:
+
+```sh
+./build/release/producer --help
+./build/release/consumer --help
+```
+
+## Transfer summaries
+
+The producer reports `total_messages_sent`, `total_payload_bytes_sent`,
+`total_elapsed_time_seconds`, and `transfer_rate_bytes_per_second`. The
+consumer reports the corresponding `total_messages_received` and
+`total_payload_bytes_received` fields, plus the same total elapsed-time and
+rate fields. Payload sizes and readable rates use decimal units (1 kB = 1,000
+bytes); the raw rate is also printed in B/s. Payload byte counts do not include
+record metadata or the larger hexadecimal output representation.
+
+The producer's elapsed time starts immediately before it begins producing
+messages and ends after the consumer reports that the shared-memory ring has
+drained. It includes random payload generation, queue backpressure, and waiting
+for the consumer to drain the ring; it does not wait for the consumer's file
+writer to finish flushing.
+
+The consumer reports `ring_drain_elapsed_seconds` and
+`ring_drain_transfer_rate_bytes_per_second` from the start of its receive loop
+until the shared-memory ring is empty. It also reports total elapsed time and
+transfer rate; these include waiting for input and finishing/flushing the
+hexadecimal file writer. These are end-to-end sample measurements, not isolated
+shared-memory bandwidth benchmarks: payload generation, queueing, scheduling,
+and file output affect the results.
 
 The debug binaries are `build/debug/consumer` and `build/debug/producer`; run
 both endpoints from the same build type. Sanitizers add runtime overhead and
@@ -99,7 +139,7 @@ binaries with `make clean`.
 - `spsc_ringbuffer.hpp` — fixed-capacity SPSC ring buffer and an alternate
   implementation retained for comparison.
 - `shared_queue_storage.hpp` — in-place shared-memory layout, compatibility
-  metadata, ring, and producer-completion flag.
+  metadata, ring, and endpoint-completion flags.
 - `shm_log_queue_mapping.hpp` / `shm_log_queue_mapping.cpp` — shared-memory
   creation, mapping, readiness, role-checked queue operations, and cleanup.
 - `shm_queue_eventfd.hpp` / `shm_queue_eventfd.cpp` — eventfd notifications,

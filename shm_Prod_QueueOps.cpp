@@ -5,37 +5,34 @@
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
-#include <sys/timerfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <random>
+#include <string_view>
 #include <system_error>
 #include <thread>
 
 #include "log_queue_config.hpp"
 #include "shm_log_queue_mapping.hpp"
 #include "shm_queue_eventfd.hpp"
+#include "transfer_stats.hpp"
 
 namespace {
 
-constexpr std::array<const char*, 6> kLevelNames{"DEBUG", "INFO",     "WARN",
-                                                 "ERROR", "CRITICAL", "FATAL"};
-
-constexpr std::array<const char*, 7> kMessages{
-    "login success",     "HTTP 200 OK",         "login failure - Incorrect password",
-    "dns failure",       "certificate expired", "TLS handshake failure",
-    "connection refused"};
-
 constexpr std::uint32_t kSpaceAvailableEvent = 1;
 constexpr std::uint32_t kSignalEvent = 2;
-constexpr std::uint32_t kTimeoutEvent = 3;
-constexpr int kRunDurationSeconds = 20;
 
 // Register a readable descriptor and its event identifier with epoll.
 void watch_descriptor(int epoll_fd, int fd, std::uint32_t id) {
@@ -47,13 +44,27 @@ void watch_descriptor(int epoll_fd, int fd, std::uint32_t id) {
   }
 }
 
-// Generate and enqueue log events, pausing at the high watermark until the queue drains.
-int produce_events(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
-                   const SharedQueueEventFd& event_notifications, int signal_fd, int timer_fd,
-                   const std::atomic<int>& server_error) {
+void fill_random_payload(LogEvent& event, std::size_t payload_bytes,
+                         std::mt19937_64& random_engine) {
+  std::uniform_int_distribution<unsigned int> random_byte(0, 0xFF);
+  std::generate_n(event.payload, payload_bytes, [&random_engine, &random_byte] {
+    return static_cast<std::byte>(random_byte(random_engine));
+  });
+  event.message_length = payload_bytes;
+}
+
+int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
+                     const SharedQueueEventFd& event_notifications, int signal_fd,
+                     const std::atomic<int>& server_error, const TransferOptions& options) {
   std::size_t event_count = 0;
   bool paused_for_watermark = false;
   int producer_error = 0;
+  std::uint64_t payload_total_bytes = 0;
+  std::mt19937_64 random_engine;
+  std::random_device random_device;
+  random_engine.seed(random_device());
+  std::uniform_int_distribution<std::size_t> random_payload_size(kMinimumPayloadBytes,
+                                                                  kLogMessageSize);
 
   UniqueFileDescriptor epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
   if (!epoll_fd) {
@@ -61,20 +72,17 @@ int produce_events(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
   }
   watch_descriptor(epoll_fd.get(), event_notifications.space_available_fd(), kSpaceAvailableEvent);
   watch_descriptor(epoll_fd.get(), signal_fd, kSignalEvent);
-  watch_descriptor(epoll_fd.get(), timer_fd, kTimeoutEvent);
+  const auto transfer_start = std::chrono::steady_clock::now();
 
-  for (;;) {
+  while (event_count < options.messages) {
     if ((producer_error = server_error.load()) != 0) {
       break;
     }
     if (paused_for_watermark && mapping.queue_size() <= kLogQueueLowWatermark) {
       paused_for_watermark = false;
-      std::cout << "Producer waking up due to low Queue watermark " << mapping.queue_size() << '\n';
     }
 
-    // Poll shutdown while producing; block only under backpressure. Signals and
-    // the deadline wake this same wait even if no consumer ever connects.
-    std::array<epoll_event, 3> ready_events{};
+    std::array<epoll_event, 2> ready_events{};
     const int ready_count = ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(),
                                          paused_for_watermark ? -1 : 0);
     if (ready_count == -1) {
@@ -102,12 +110,7 @@ int produce_events(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
           producer_error = bytes == -1 ? -errno : -EIO;
           break;
         }
-        std::cout << "Received " << (info.ssi_signo == SIGINT ? "SIGINT" : "SIGTERM")
-                  << "; stopping producer.\n";
-        shutdown_requested = true;
-      } else if (event.data.u32 == kTimeoutEvent) {
-        // The timer is one-shot and is closed after this loop returns.
-        std::cout << "20-second timeout elapsed; stopping producer.\n";
+        producer_error = -EINTR;
         shutdown_requested = true;
       } else if (event.data.u32 == kSpaceAvailableEvent) {
         producer_error = drain_eventfd(event_notifications.space_available_fd());
@@ -129,20 +132,18 @@ int produce_events(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
 
     LogEvent event{};
     event.LogEventId = event_count + 1;
-    std::snprintf(event.ip, sizeof(event.ip), "10.10.10.%zu", (event_count % 254) + 1);
-    event.level = static_cast<Level>(event_count % kLevelNames.size());
-    std::snprintf(event.message, sizeof(event.message), "%s",
-                  kMessages[event_count % kMessages.size()]);
+    const std::size_t payload_bytes =
+        options.payload_bytes == 0 ? random_payload_size(random_engine) : options.payload_bytes;
+    fill_random_payload(event, payload_bytes, random_engine);
 
     if (!mapping.enqueue(event)) {
-      // The generated event remains reproducible from event_count and is
-      // retried after backpressure clears; the producer never skips its ID.
       paused_for_watermark = true;
       continue;
     }
 
-    // Always count and notify consumer on a successful enqueue before pausing.
     ++event_count;
+    payload_total_bytes += event.message_length;
+
     const int notify_error = event_notifications.notify();
     if (notify_error != 0) {
       producer_error = notify_error;
@@ -151,7 +152,6 @@ int produce_events(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
     const auto queue_size = mapping.queue_size();
     if (queue_size >= kLogQueueHighWatermark) {
       paused_for_watermark = true;
-      std::cout << "Producer pausing at high Queue watermark " << queue_size << '\n';
     }
   }
 
@@ -161,7 +161,46 @@ int produce_events(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping,
     producer_error = notify_error;
   }
 
-  std::cout << "Producer stopped after enqueueing " << event_count << " events.\n";
+  while (producer_error == 0 && !mapping.consumer_done()) {
+    std::array<epoll_event, 2> ready_events{};
+    const int ready_count =
+        ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), -1);
+    if (ready_count == -1) {
+      if (errno == EINTR) {
+        continue;
+      }
+      producer_error = -errno;
+      break;
+    }
+    for (int i = 0; i < ready_count; ++i) {
+      if (ready_events[i].data.u32 == kSpaceAvailableEvent) {
+        producer_error = drain_eventfd(event_notifications.space_available_fd());
+        if (producer_error != 0) {
+          break;
+        }
+      } else if (ready_events[i].data.u32 == kSignalEvent) {
+        signalfd_siginfo info{};
+        while (::read(signal_fd, &info, sizeof(info)) == -1 && errno == EINTR) {
+        }
+      } else {
+        producer_error = -EIO;
+        break;
+      }
+    }
+  }
+
+  const double elapsed_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - transfer_start).count();
+  const double bytes_per_second =
+      elapsed_seconds > 0.0 ? static_cast<double>(payload_total_bytes) / elapsed_seconds : 0.0;
+  std::cout << "Producer transfer summary:\n"
+            << "  total_messages_sent=" << event_count << "\n"
+            << "  total_payload_bytes_sent=" << payload_total_bytes << " ["
+            << format_byte_size(payload_total_bytes) << "]\n"
+            << "  total_elapsed_time_seconds=" << elapsed_seconds << "\n"
+            << "  transfer_rate_bytes_per_second=" << std::fixed << std::setprecision(1)
+            << bytes_per_second << " [" << format_byte_rate(bytes_per_second) << "]\n";
+
   if (producer_error != 0) {
     std::cerr << "Producer failed: " << std::strerror(-producer_error) << " (" << producer_error
               << ").\n";
@@ -199,33 +238,92 @@ int setup_signals_init() {
   return ::signalfd(-1, &stop_signals, SFD_CLOEXEC | SFD_NONBLOCK);
 }
 
-// Arm an owned one-shot timer; RAII closes it if configuration fails.
-int setup_timers_init() {
-  UniqueFileDescriptor timer_fd(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
-  if (!timer_fd) {
-    throw std::system_error(errno, std::generic_category(), "timerfd_create");
-  }
-  itimerspec deadline{};
-  deadline.it_value.tv_sec = kRunDurationSeconds;
-  if (::timerfd_settime(timer_fd.get(), 0, &deadline, nullptr) == -1) {
-    throw std::system_error(errno, std::generic_category(), "timerfd_settime");
-  }
-  return timer_fd.release();
+void print_producer_help(const char* program) {
+  std::cout << "Usage: " << program << " [--messages N] [--payload-bytes N] [--help]\n\n"
+            << "  --messages N       Number of random payloads (default "
+            << kDefaultTransferMessages << ").\n"
+            << "  --payload-bytes N  Fixed payload size, 1-" << kLogMessageSize
+            << " (default: random " << kMinimumPayloadBytes << "-" << kLogMessageSize
+            << ").\n"
+            << "  --help             Show this help.\n";
 }
 
-// Initialize IPC and shutdown descriptors, run producer, then join the handoff server.
-int main() {
+bool parse_size_argument(int argc, char* argv[], int& index, const char* name,
+                         std::size_t& value) {
+  if (index + 1 >= argc) {
+    std::cerr << "Missing value for " << name << ".\n";
+    return false;
+  }
+  const std::string_view input(argv[index + 1]);
+  std::size_t parsed{};
+  const auto [end, error] = std::from_chars(input.data(), input.data() + input.size(), parsed);
+  if (error != std::errc{} || end != input.data() + input.size()) {
+    std::cerr << "Invalid non-negative integer for " << name << ": " << input << ".\n";
+    return false;
+  }
+  value = parsed;
+  ++index;
+  return true;
+}
+
+// Initialize IPC, transfer random payloads, and wait for consumer completion.
+int main(int argc, char* argv[]) {
+  TransferOptions options;
+  bool messages_option_seen = false;
+  bool payload_option_seen = false;
   try {
+    for (int i = 1; i < argc; ++i) {
+      const std::string_view argument(argv[i]);
+      if (argument == "--help" || argument == "-h") {
+        print_producer_help(argv[0]);
+        return 0;
+      }
+      if (argument == "--messages") {
+        if (messages_option_seen) {
+          std::cerr << "Option specified more than once: --messages.\n";
+          return 2;
+        }
+        messages_option_seen = true;
+        if (!parse_size_argument(argc, argv, i, "--messages", options.messages)) {
+          return 2;
+        }
+      } else if (argument == "--payload-bytes") {
+        if (payload_option_seen) {
+          std::cerr << "Option specified more than once: --payload-bytes.\n";
+          return 2;
+        }
+        payload_option_seen = true;
+        if (!parse_size_argument(argc, argv, i, "--payload-bytes", options.payload_bytes)) {
+          return 2;
+        }
+      } else {
+        std::cerr << "Unknown argument: " << argument << "\n";
+        print_producer_help(argv[0]);
+        return 2;
+      }
+    }
+    if (options.messages == 0) {
+      std::cerr << "--messages must be positive.\n";
+      return 2;
+    }
+    if (options.payload_bytes > kLogMessageSize) {
+      std::cerr << "--payload-bytes must not exceed " << kLogMessageSize << ".\n";
+      return 2;
+    }
+    if (payload_option_seen && options.payload_bytes == 0) {
+      std::cerr << "Invalid payload size: --payload-bytes must be positive.\n";
+      return 2;
+    }
+    if (options.messages >
+        std::numeric_limits<std::uint64_t>::max() / kLogMessageSize) {
+      std::cerr << "Total payload bytes exceed the supported range.\n";
+      return 2;
+    }
+
     int sig_raw_fd = setup_signals_init();
     UniqueFileDescriptor signal_fd(sig_raw_fd);
     if (!signal_fd) {
       throw std::system_error(errno, std::generic_category(), "signalfd");
-    }
-
-    int timer_raw_fd = setup_timers_init();
-    UniqueFileDescriptor timer_fd(timer_raw_fd);
-    if (!timer_fd) {
-      throw std::system_error(errno, std::generic_category(), "timerfd_create");
     }
 
     SharedQueueEventFd event_notifications;
@@ -236,12 +334,8 @@ int main() {
                                      std::cref(event_notifications), std::ref(server_error));
     mapping.post_ready();
 
-    std::cout << "Initialized shared-memory log queue.\n";
-    std::cout << "Producing log events continuously. Press Ctrl+C to stop.\n";
-
-    // Production and shutdown share one event loop; no blocked producer thread to join.
     const int exit_status =
-        produce_events(mapping, event_notifications, signal_fd.get(), timer_fd.get(), server_error);
+        produce_messages(mapping, event_notifications, signal_fd.get(), server_error, options);
     notification_server.request_stop();
     notification_server.join();
     return server_error.load() != 0 ? 1 : exit_status;

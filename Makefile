@@ -13,13 +13,16 @@ PRODUCTION_FLAGS := -std=c++23 $(COMMON_WARNINGS) -O3 -DNDEBUG $(THREAD_FLAGS)
 DEBUG_FLAGS := -std=c++23 $(COMMON_WARNINGS) -O1 -g3 \
 	-fsanitize=address,undefined -fno-omit-frame-pointer $(THREAD_FLAGS)
 
-.PHONY: all release debug clean
+.PHONY: all release debug test clean
 
 all: release debug
 
 release: $(PRODUCTION_DIR)/producer $(PRODUCTION_DIR)/consumer
 
 debug: $(DEBUG_DIR)/producer $(DEBUG_DIR)/consumer
+
+test: debug
+	python3 -B -m unittest -v test_cli.py
 
 $(PRODUCTION_DIR) $(DEBUG_DIR):
 	mkdir -p $@

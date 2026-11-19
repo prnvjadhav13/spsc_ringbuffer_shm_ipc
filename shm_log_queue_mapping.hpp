@@ -18,8 +18,9 @@
 // mapping, file descriptor, semaphore handles, and (for the producer) the
 // names it created; it does not exclusively own the queue shared with peers.
 // Producer API: create_shared_memory_ring_buffer, enqueue,
-// mark_producer_done, and readiness methods. Consumer API:
-// open_shared_memory_ring_buffer, dequeue, producer_done, and readiness
+// mark_producer_done, consumer_done, and readiness methods. Consumer API:
+// open_shared_memory_ring_buffer, dequeue, producer_done, mark_consumer_done,
+// and readiness
 // methods. Role checks reject operations used by the wrong endpoint.
 template <typename T, std::size_t Capacity>
 class SharedLogQueueMapping {
@@ -44,6 +45,8 @@ class SharedLogQueueMapping {
   [[nodiscard]] std::size_t queue_size() const;
   void mark_producer_done();
   [[nodiscard]] bool producer_done() const;
+  void mark_consumer_done();
+  [[nodiscard]] bool consumer_done() const;
   void post_ready() const;
   bool wait_until_ready(int signal_fd) const;
 

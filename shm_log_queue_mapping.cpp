@@ -10,8 +10,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -20,6 +22,20 @@
 
 #include "log_queue_config.hpp"
 #include "shm_signal_wait.hpp"
+
+namespace {
+
+template <typename T, std::size_t Capacity>
+off_t checked_storage_file_size() {
+  constexpr std::size_t storage_size = sizeof(SharedQueueStorage<T, Capacity>);
+  if (static_cast<std::uintmax_t>(storage_size) >
+      static_cast<std::uintmax_t>(std::numeric_limits<off_t>::max())) {
+    throw std::length_error("Shared-memory queue size does not fit in off_t");
+  }
+  return static_cast<off_t>(storage_size);
+}
+
+}  // namespace
 
 // Release this mapping and unlink IPC names only when this instance owns them.
 template <typename T, std::size_t Capacity>
@@ -50,6 +66,7 @@ void SharedLogQueueMapping<T, Capacity>::create_shared_memory_ring_buffer() {
   if (mapping_ != nullptr || fd_ != -1 || ready_ != SEM_FAILED) {
     throw std::logic_error("SharedLogQueueMapping is already open");
   }
+  const off_t storage_file_size = checked_storage_file_size<T, Capacity>();
 
   ready_ = sem_open(kLogQueueReadySemaphoreName, O_CREAT | O_EXCL, 0660, 0);
   if (ready_ == SEM_FAILED) {
@@ -63,7 +80,7 @@ void SharedLogQueueMapping<T, Capacity>::create_shared_memory_ring_buffer() {
   }
   owns_shared_memory_name_ = true;
 
-  if (ftruncate(fd_, static_cast<off_t>(sizeof(SharedQueueStorage<T, Capacity>))) == -1) {
+  if (ftruncate(fd_, storage_file_size) == -1) {
     throw_errno("ftruncate");
   }
 
@@ -84,6 +101,7 @@ bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int sign
   if (mapping_ != nullptr || fd_ != -1 || ready_ != SEM_FAILED) {
     throw std::logic_error("SharedLogQueueMapping is already open");
   }
+  const off_t storage_file_size = checked_storage_file_size<T, Capacity>();
 
   for (;;) {
     fd_ = shm_open(kLogQueueSharedMemoryName, O_RDWR, 0);
@@ -124,7 +142,7 @@ bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int sign
     if (fstat(fd_, &info) == -1) {
       throw_errno("fstat");
     }
-    if (info.st_size == static_cast<off_t>(sizeof(SharedQueueStorage<T, Capacity>))) {
+    if (info.st_size == storage_file_size) {
       break;
     }
     if (info.st_size != 0) {
@@ -187,6 +205,20 @@ template <typename T, std::size_t Capacity>
 bool SharedLogQueueMapping<T, Capacity>::producer_done() const {
   require_role(Role::consumer, "read producer completion state");
   return shared_->producer_done.load(std::memory_order_acquire);
+}
+
+// Publish that the consumer drained and flushed all queued messages.
+template <typename T, std::size_t Capacity>
+void SharedLogQueueMapping<T, Capacity>::mark_consumer_done() {
+  require_role(Role::consumer, "mark consumer done");
+  shared_->consumer_done.store(true, std::memory_order_release);
+}
+
+// Read consumer completion after verifying the producer mapping is open.
+template <typename T, std::size_t Capacity>
+bool SharedLogQueueMapping<T, Capacity>::consumer_done() const {
+  require_role(Role::producer, "read consumer completion state");
+  return shared_->consumer_done.load(std::memory_order_acquire);
 }
 
 // Publish producer readiness by posting the initialization semaphore.

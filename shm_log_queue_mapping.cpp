@@ -35,6 +35,13 @@ off_t checked_storage_file_size() {
   return static_cast<off_t>(storage_size);
 }
 
+void unlink_if_present(int (*unlink_resource)(const char*), const char* name,
+                       const char* operation) {
+  if (unlink_resource(name) == -1 && errno != ENOENT) {
+    throw std::system_error(errno, std::generic_category(), operation);
+  }
+}
+
 }  // namespace
 
 // Release this mapping and unlink IPC names only when this instance owns them.
@@ -67,6 +74,11 @@ void SharedLogQueueMapping<T, Capacity>::create_shared_memory_ring_buffer() {
     throw std::logic_error("SharedLogQueueMapping is already open");
   }
   const off_t storage_file_size = checked_storage_file_size<T, Capacity>();
+
+  // The producer binds its exclusive notification socket before calling here.
+  // If that succeeded, no live producer owns these fixed-name resources.
+  unlink_if_present(shm_unlink, kLogQueueSharedMemoryName, "shm_unlink stale queue");
+  unlink_if_present(sem_unlink, kLogQueueReadySemaphoreName, "sem_unlink stale readiness");
 
   ready_ = sem_open(kLogQueueReadySemaphoreName, O_CREAT | O_EXCL, 0660, 0);
   if (ready_ == SEM_FAILED) {

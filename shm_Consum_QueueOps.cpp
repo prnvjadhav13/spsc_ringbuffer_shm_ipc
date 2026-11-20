@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -39,8 +40,9 @@ constexpr std::uint32_t kEpollEventQueue = 1;
 constexpr std::uint32_t kEpollEventSignal = 2;
 constexpr char kHexDigits[] = "0123456789abcdef";
 constexpr std::size_t kPayloadWriterQueueCapacity = kLogQueueCapacity / 2;
+constexpr std::size_t kSignalCheckBatchSize = 64;
 
-int read_signal(int signal_fd) {
+std::optional<int> read_signal(int signal_fd) {
   signalfd_siginfo signal_info{};
   for (;;) {
     const auto bytes_read = ::read(signal_fd, &signal_info, sizeof(signal_info));
@@ -51,7 +53,7 @@ int read_signal(int signal_fd) {
       continue;
     }
     if (bytes_read == -1 && errno == EAGAIN) {
-      return 0;
+      return std::nullopt;
     }
     if (bytes_read == -1) {
       throw std::system_error(errno, std::generic_category(), "read signalfd");
@@ -253,14 +255,21 @@ int main(int argc, char* argv[]) {
   try {
     SharedLogQueueMapping<LogEvent, kLogQueueCapacity> mapping;
     if (!mapping.open_shared_memory_ring_buffer(signal_fd.get())) {
-      return 128 + read_signal(signal_fd.get());
+      const auto signal = read_signal(signal_fd.get());
+      return signal ? 128 + *signal : 1;
     }
     if (!mapping.wait_until_ready(signal_fd.get())) {
-      return 128 + read_signal(signal_fd.get());
+      const auto signal = read_signal(signal_fd.get());
+      return signal ? 128 + *signal : 1;
     }
 
     auto notification_fds = SharedQueueEventFd::receive(signal_fd.get());
     if (!notification_fds.queue_ready || !notification_fds.space_available) {
+      const auto signal = read_signal(signal_fd.get());
+      if (signal) {
+        return 128 + *signal;
+      }
+      std::cerr << "Producer notification handoff did not complete before timeout.\n";
       return 1;
     }
 
@@ -291,6 +300,11 @@ int main(int argc, char* argv[]) {
                        output_path, std::ref(encoded_payload), std::ref(output_ok),
                        std::ref(writer_error));
     PayloadWriterThread writer_thread(writer_queue, std::move(writer));
+    const int attach_notify_error = notify_eventfd(notification_fds.space_available.get());
+    if (attach_notify_error != 0) {
+      throw std::system_error(-attach_notify_error, std::generic_category(),
+                              "notify producer of consumer attachment");
+    }
 
     const auto transfer_start = std::chrono::steady_clock::now();
     std::size_t messages_received = 0;
@@ -314,9 +328,15 @@ int main(int argc, char* argv[]) {
         if (ready_events[i].data.u32 == kEpollEventQueue) {
           queue_notified = true;
         } else if (ready_events[i].data.u32 == kEpollEventSignal) {
-          received_signal = read_signal(signal_fd.get());
-          queue_notified = true;
+          if (const auto signal = read_signal(signal_fd.get());
+              signal && received_signal == 0) {
+            received_signal = *signal;
+          }
         }
+      }
+      if (received_signal != 0) {
+        ring_drain_end = std::chrono::steady_clock::now();
+        break;
       }
       if (!queue_notified) {
         continue;
@@ -329,6 +349,7 @@ int main(int argc, char* argv[]) {
       }
 
       LogEvent message{};
+      std::size_t messages_since_signal_check = 0;
       while (mapping.dequeue(message)) {
         const std::size_t queue_size = mapping.queue_size();
         if (message.message_length == 0 || message.message_length > kLogMessageSize) {
@@ -356,10 +377,33 @@ int main(int argc, char* argv[]) {
             output_ok.store(false, std::memory_order_relaxed);
           }
         }
+
+        if (++messages_since_signal_check == kSignalCheckBatchSize) {
+          messages_since_signal_check = 0;
+          if (const auto signal = read_signal(signal_fd.get());
+              signal && received_signal == 0) {
+            received_signal = *signal;
+            break;
+          }
+        }
+      }
+
+      if (const auto signal = read_signal(signal_fd.get());
+          signal && received_signal == 0) {
+        received_signal = *signal;
+      }
+
+      if (received_signal != 0) {
+        ring_drain_end = std::chrono::steady_clock::now();
+        break;
       }
 
       if (mapping.producer_done() && mapping.queue_size() == 0) {
         ring_drain_end = std::chrono::steady_clock::now();
+        if (const auto signal = read_signal(signal_fd.get());
+            signal && received_signal == 0) {
+          received_signal = *signal;
+        }
         mapping.mark_consumer_done();
         const int notify_error = notify_eventfd(notification_fds.space_available.get());
         if (notify_error != 0) {
@@ -367,10 +411,11 @@ int main(int argc, char* argv[]) {
                     << std::strerror(-notify_error) << ".\n";
           output_ok.store(false, std::memory_order_relaxed);
         }
-        writer_thread.finish();
         break;
       }
     }
+
+    writer_thread.finish();
 
     const double elapsed_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - transfer_start).count();

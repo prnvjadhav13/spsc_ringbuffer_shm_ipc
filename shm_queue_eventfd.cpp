@@ -26,6 +26,7 @@
 namespace {
 
 constexpr std::string_view kSocketName = "shm_log_ring_buffer_eventfd";
+constexpr auto kNotificationConnectTimeout = std::chrono::seconds(3);
 
 // Build the abstract Unix-domain socket address used for descriptor handoff.
 sockaddr_un socket_address() {
@@ -68,7 +69,28 @@ UniqueFileDescriptor create_listener() {
 }
 
 // Receive and validate both eventfds via SCM_RIGHTS; close descriptors on malformed handoff.
-SharedQueueNotificationFds receive_eventfds(int connection) {
+SharedQueueNotificationFds receive_eventfds(int connection, int signal_fd) {
+  std::array<pollfd, 2> descriptors{{{connection, POLLIN, 0}, {signal_fd, POLLIN, 0}}};
+  for (;;) {
+    const int ready = ::poll(descriptors.data(), descriptors.size(), -1);
+    if (ready == -1) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw std::system_error(errno, std::generic_category(), "poll for notification handoff");
+    }
+    if (descriptors[1].revents & POLLIN) {
+      return {UniqueFileDescriptor{}, UniqueFileDescriptor{}};
+    }
+    if (descriptors[0].revents & POLLIN) {
+      break;
+    }
+    if (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+      throw std::runtime_error("notification handoff connection failed");
+    }
+    throw std::system_error(EIO, std::generic_category(), "poll for notification handoff");
+  }
+
   std::array<char, 2> payload{};
   iovec data{payload.data(), payload.size()};
   alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
@@ -267,6 +289,7 @@ void SharedQueueEventFd::serve_consumers(std::stop_token stop) const {
 
 // Connect to the producer and receive its eventfds; return empty owners if startup is interrupted.
 SharedQueueNotificationFds SharedQueueEventFd::receive(int signal_fd) {
+  const auto connect_deadline = std::chrono::steady_clock::now() + kNotificationConnectTimeout;
   for (;;) {
     UniqueFileDescriptor connection(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
     if (!connection) {
@@ -278,6 +301,9 @@ SharedQueueNotificationFds SharedQueueEventFd::receive(int signal_fd) {
                   address_length()) == -1) {
       const int connect_error = errno;
       if (connect_error == ENOENT || connect_error == ECONNREFUSED || connect_error == EINTR) {
+        if (std::chrono::steady_clock::now() >= connect_deadline) {
+          return {UniqueFileDescriptor{}, UniqueFileDescriptor{}};
+        }
         if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50))) {
           return {UniqueFileDescriptor{}, UniqueFileDescriptor{}};
         }
@@ -287,7 +313,7 @@ SharedQueueNotificationFds SharedQueueEventFd::receive(int signal_fd) {
                               "connect notification socket");
     }
 
-    return receive_eventfds(connection.get());
+    return receive_eventfds(connection.get(), signal_fd);
   }
 }
 

@@ -33,6 +33,21 @@ namespace {
 
 constexpr std::uint32_t kSpaceAvailableEvent = 1;
 constexpr std::uint32_t kSignalEvent = 2;
+constexpr auto kConsumerAttachGracePeriod = std::chrono::seconds(3);
+constexpr auto kConsumerDrainGracePeriod = std::chrono::seconds(5);
+
+int consume_signal(int signal_fd, int& signal_number) {
+  signalfd_siginfo info{};
+  ssize_t bytes;
+  do {
+    bytes = ::read(signal_fd, &info, sizeof(info));
+  } while (bytes == -1 && errno == EINTR);
+  if (bytes != static_cast<ssize_t>(sizeof(info))) {
+    return bytes == -1 ? -errno : -EIO;
+  }
+  signal_number = static_cast<int>(info.ssi_signo);
+  return 0;
+}
 
 // Register a readable descriptor and its event identifier with epoll.
 void watch_descriptor(int epoll_fd, int fd, std::uint32_t id) {
@@ -59,6 +74,12 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
   std::size_t event_count = 0;
   bool paused_for_watermark = false;
   int producer_error = 0;
+  int received_signal = 0;
+  bool consumer_attached = false;
+  std::chrono::steady_clock::time_point consumer_attach_deadline{};
+  std::chrono::steady_clock::time_point consumer_drain_deadline{};
+  bool consumer_drain_deadline_set = false;
+  bool shutdown_incomplete = false;
   std::uint64_t payload_total_bytes = 0;
   std::mt19937_64 random_engine;
   std::random_device random_device;
@@ -73,6 +94,26 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
   watch_descriptor(epoll_fd.get(), event_notifications.space_available_fd(), kSpaceAvailableEvent);
   watch_descriptor(epoll_fd.get(), signal_fd, kSignalEvent);
   const auto transfer_start = std::chrono::steady_clock::now();
+  const auto record_signal = [&](int signal_number) {
+    if (received_signal == 0) {
+      received_signal = signal_number;
+      consumer_attach_deadline =
+          std::chrono::steady_clock::now() + kConsumerAttachGracePeriod;
+      if (consumer_attached) {
+        consumer_drain_deadline =
+            std::chrono::steady_clock::now() + kConsumerDrainGracePeriod;
+        consumer_drain_deadline_set = true;
+      }
+    }
+  };
+  const auto record_consumer_attachment = [&] {
+    consumer_attached = true;
+    if (received_signal != 0 && !consumer_drain_deadline_set) {
+      consumer_drain_deadline =
+          std::chrono::steady_clock::now() + kConsumerDrainGracePeriod;
+      consumer_drain_deadline_set = true;
+    }
+  };
 
   while (event_count < options.messages) {
     if ((producer_error = server_error.load()) != 0) {
@@ -96,33 +137,37 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
     bool shutdown_requested = false;
     for (int i = 0; i < ready_count; ++i) {
       const auto& event = ready_events[i];
+      if (event.data.u32 == kSignalEvent) {
+        int signal_number = 0;
+        producer_error = consume_signal(signal_fd, signal_number);
+        if (producer_error == 0) {
+          record_signal(signal_number);
+          shutdown_requested = true;
+        }
+        break;
+      }
+    }
+    if (shutdown_requested || producer_error != 0) {
+      break;
+    }
+    for (int i = 0; i < ready_count; ++i) {
+      const auto& event = ready_events[i];
       if ((event.events & (EPOLLERR | EPOLLHUP)) || !(event.events & EPOLLIN)) {
         producer_error = -EIO;
         break;
       }
-      if (event.data.u32 == kSignalEvent) {
-        signalfd_siginfo info{};
-        ssize_t bytes;
-        do {
-          bytes = ::read(signal_fd, &info, sizeof(info));
-        } while (bytes == -1 && errno == EINTR);
-        if (bytes != static_cast<ssize_t>(sizeof(info))) {
-          producer_error = bytes == -1 ? -errno : -EIO;
-          break;
-        }
-        producer_error = -EINTR;
-        shutdown_requested = true;
-      } else if (event.data.u32 == kSpaceAvailableEvent) {
+      if (event.data.u32 == kSpaceAvailableEvent) {
         producer_error = drain_eventfd(event_notifications.space_available_fd());
         if (producer_error != 0) {
           break;
         }
+        record_consumer_attachment();
       } else {
         producer_error = -EIO;
         break;
       }
     }
-    if (shutdown_requested || producer_error != 0) {
+    if (producer_error != 0) {
       break;
     }
     if (paused_for_watermark) {
@@ -162,9 +207,26 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
   }
 
   while (producer_error == 0 && !mapping.consumer_done()) {
+    if ((producer_error = server_error.load()) != 0) {
+      break;
+    }
+
+    int timeout_ms = -1;
+    if (received_signal != 0) {
+      const auto deadline =
+          consumer_attached ? consumer_drain_deadline : consumer_attach_deadline;
+      const auto remaining =
+          std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) {
+        shutdown_incomplete = true;
+        break;
+      }
+      timeout_ms = static_cast<int>(remaining.count());
+    }
+
     std::array<epoll_event, 2> ready_events{};
     const int ready_count =
-        ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), -1);
+        ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), timeout_ms);
     if (ready_count == -1) {
       if (errno == EINTR) {
         continue;
@@ -172,20 +234,53 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
       producer_error = -errno;
       break;
     }
+    if (ready_count == 0) {
+      continue;
+    }
+
     for (int i = 0; i < ready_count; ++i) {
+      if (ready_events[i].data.u32 == kSignalEvent) {
+        int signal_number = 0;
+        producer_error = consume_signal(signal_fd, signal_number);
+        if (producer_error == 0) {
+          record_signal(signal_number);
+        }
+        break;
+      }
+    }
+    if (producer_error != 0) {
+      break;
+    }
+
+    for (int i = 0; i < ready_count; ++i) {
+      if (ready_events[i].data.u32 == kSignalEvent) {
+        continue;
+      }
       if (ready_events[i].data.u32 == kSpaceAvailableEvent) {
+        if ((ready_events[i].events & (EPOLLERR | EPOLLHUP)) ||
+            !(ready_events[i].events & EPOLLIN)) {
+          producer_error = -EIO;
+          break;
+        }
         producer_error = drain_eventfd(event_notifications.space_available_fd());
         if (producer_error != 0) {
           break;
         }
-      } else if (ready_events[i].data.u32 == kSignalEvent) {
-        signalfd_siginfo info{};
-        while (::read(signal_fd, &info, sizeof(info)) == -1 && errno == EINTR) {
-        }
+        record_consumer_attachment();
       } else {
         producer_error = -EIO;
         break;
       }
+    }
+  }
+
+  if (received_signal == 0) {
+    int signal_number = 0;
+    const int signal_error = consume_signal(signal_fd, signal_number);
+    if (signal_error == 0) {
+      record_signal(signal_number);
+    } else if (signal_error != -EAGAIN && producer_error == 0) {
+      producer_error = signal_error;
     }
   }
 
@@ -201,11 +296,16 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
             << "  transfer_rate_bytes_per_second=" << std::fixed << std::setprecision(1)
             << bytes_per_second << " [" << format_byte_rate(bytes_per_second) << "]\n";
 
-  if (producer_error != 0) {
+  if (producer_error != 0 && received_signal == 0) {
     std::cerr << "Producer failed: " << std::strerror(-producer_error) << " (" << producer_error
               << ").\n";
   }
-  return producer_error != 0 ? 1 : 0;
+  if (shutdown_incomplete) {
+    std::cerr << "Producer shutdown timed out waiting for the consumer to "
+              << (consumer_attached ? "complete" : "connect")
+              << "; queued messages may not have been written.\n";
+  }
+  return received_signal != 0 ? 128 + received_signal : (producer_error != 0 ? 1 : 0);
 }
 
 // Run the descriptor handoff server and report exceptions within its worker thread.
@@ -338,7 +438,7 @@ int main(int argc, char* argv[]) {
         produce_messages(mapping, event_notifications, signal_fd.get(), server_error, options);
     notification_server.request_stop();
     notification_server.join();
-    return server_error.load() != 0 ? 1 : exit_status;
+    return exit_status != 0 ? exit_status : (server_error.load() != 0 ? 1 : 0);
   } catch (const std::exception& error) {
     std::cerr << "Producer setup or runtime failed: " << error.what() << '\n';
     return 1;

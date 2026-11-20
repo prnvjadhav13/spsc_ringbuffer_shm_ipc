@@ -1,8 +1,10 @@
 import math
 import pathlib
 import re
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -147,6 +149,229 @@ class TransferCliTests(unittest.TestCase):
         positional_path = run_cli(CONSUMER, "payloads.hex")
         self.assertEqual(positional_path.returncode, 2)
         self.assertIn("Unknown argument: payloads.hex", positional_path.stderr)
+
+    def test_producer_exits_when_signaled_while_waiting_for_consumer(self):
+        for stop_signal in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=stop_signal):
+                producer = subprocess.Popen(
+                    [str(PRODUCER), "--messages", "1", "--payload-bytes", "64"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    time.sleep(0.1)
+                    self.assertIsNone(producer.poll(), "Producer exited before receiving signal")
+                    producer.send_signal(stop_signal)
+                    stdout, stderr = producer.communicate(timeout=5)
+                    self.assertEqual(producer.returncode, 128 + stop_signal, stderr)
+                    self.assertIn("total_messages_sent=1", stdout)
+                    self.assertIn("timed out waiting for the consumer to connect", stderr)
+                finally:
+                    if producer.poll() is None:
+                        producer.kill()
+                        producer.communicate()
+
+    def test_producer_signal_waits_for_consumer_to_flush_output(self):
+        with tempfile.TemporaryDirectory() as working_directory:
+            output_path = pathlib.Path(working_directory) / "payloads.hex"
+            producer = subprocess.Popen(
+                [
+                    str(PRODUCER),
+                    "--messages",
+                    "100000",
+                    "--payload-bytes",
+                    "1024",
+                ],
+                cwd=working_directory,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            consumer = None
+            try:
+                consumer = subprocess.Popen(
+                    [str(CONSUMER), "--file-path", str(output_path)],
+                    cwd=working_directory,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not output_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(output_path.exists(), "Consumer did not start")
+                time.sleep(0.1)
+
+                producer.send_signal(signal.SIGTERM)
+                producer_stdout, producer_stderr = producer.communicate(timeout=15)
+                consumer_stdout, consumer_stderr = consumer.communicate(timeout=15)
+
+                self.assertEqual(producer.returncode, 128 + signal.SIGTERM, producer_stderr)
+                self.assertEqual(consumer.returncode, 0, consumer_stderr)
+                sent = int(
+                    re.search(r"^  total_messages_sent=(\d+)$", producer_stdout, re.MULTILINE)
+                    .group(1)
+                )
+                self.assertEqual(len(output_path.read_text().splitlines()), sent)
+            finally:
+                if consumer is not None and consumer.poll() is None:
+                    consumer.kill()
+                    consumer.communicate()
+                if producer.poll() is None:
+                    producer.kill()
+                    producer.communicate()
+
+    def test_consumer_exits_when_signaled_during_notification_handoff(self):
+        for stop_signal in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=stop_signal):
+                producer = subprocess.Popen(
+                    [str(PRODUCER), "--messages", "1", "--payload-bytes", "64"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                consumer = None
+                try:
+                    time.sleep(0.1)
+                    self.assertIsNone(producer.poll(), "Producer exited before consumer startup")
+                    producer.send_signal(signal.SIGSTOP)
+                    with tempfile.TemporaryDirectory() as working_directory:
+                        output_path = pathlib.Path(working_directory) / "payloads.hex"
+                        consumer = subprocess.Popen(
+                            [str(CONSUMER), "--file-path", str(output_path)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        deadline = time.monotonic() + 5
+                        while not output_path.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(output_path.exists(), "Consumer did not start")
+                        time.sleep(0.1)
+                        consumer.send_signal(stop_signal)
+                        _, stderr = consumer.communicate(timeout=5)
+                        self.assertEqual(consumer.returncode, 128 + stop_signal, stderr)
+                finally:
+                    if consumer is not None and consumer.poll() is None:
+                        consumer.kill()
+                        consumer.communicate()
+                    if producer.poll() is None:
+                        producer.send_signal(signal.SIGCONT)
+                        producer.send_signal(signal.SIGTERM)
+                        try:
+                            producer.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            producer.kill()
+                            producer.communicate()
+
+    def test_consumer_exits_when_signaled_while_producer_is_active(self):
+        for stop_signal in (signal.SIGINT, signal.SIGTERM):
+            with (
+                self.subTest(signal=stop_signal),
+                tempfile.TemporaryDirectory() as working_directory,
+            ):
+                output_path = pathlib.Path(working_directory) / "payloads.hex"
+                producer = subprocess.Popen(
+                    [str(PRODUCER), "--messages", "1000000000", "--payload-bytes", "64"],
+                    cwd=working_directory,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                consumer = None
+                try:
+                    consumer = subprocess.Popen(
+                        [str(CONSUMER), "--file-path", str(output_path)],
+                        cwd=working_directory,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    deadline = time.monotonic() + 5
+                    while not output_path.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(output_path.exists(), "Consumer did not start")
+                    time.sleep(0.1)
+                    self.assertIsNone(producer.poll(), "Producer exited before consumer signal")
+
+                    consumer.send_signal(stop_signal)
+                    consumer_stdout, consumer_stderr = consumer.communicate(timeout=5)
+
+                    self.assertEqual(consumer.returncode, 128 + stop_signal, consumer_stderr)
+                    self.assertIn("Consumer transfer summary:", consumer_stdout)
+                finally:
+                    if consumer is not None and consumer.poll() is None:
+                        consumer.kill()
+                        consumer.communicate()
+                    if producer.poll() is None:
+                        producer.kill()
+                        producer.communicate()
+
+    def test_producer_recovers_resources_left_by_forced_termination(self):
+        first_producer = subprocess.Popen(
+            [str(PRODUCER), "--messages", "1", "--payload-bytes", "64"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        restarted_producer = None
+        consumer = None
+        shared_memory = pathlib.Path("/dev/shm/shm_log_ring_buffer")
+        readiness_semaphore = pathlib.Path("/dev/shm/sem.sem_log_ring_buffer_ready")
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if shared_memory.exists() and readiness_semaphore.exists():
+                    break
+                if first_producer.poll() is not None:
+                    stdout, stderr = first_producer.communicate()
+                    self.fail(f"Initial producer exited unexpectedly: {stdout}\n{stderr}")
+                time.sleep(0.01)
+            else:
+                self.fail("Producer did not create its shared-memory resources")
+
+            first_producer.kill()
+            first_producer.communicate(timeout=5)
+
+            restarted_producer = subprocess.Popen(
+                [str(PRODUCER), "--messages", "1", "--payload-bytes", "64"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                time.sleep(0.2)
+                if restarted_producer.poll() is not None:
+                    stdout, stderr = restarted_producer.communicate()
+                    self.fail(f"Restarted producer exited early: {stdout}\n{stderr}")
+                with tempfile.TemporaryDirectory() as working_directory:
+                    output_path = pathlib.Path(working_directory) / "payloads.hex"
+                    consumer = subprocess.Popen(
+                        [str(CONSUMER), "--file-path", str(output_path)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    producer_stdout, producer_stderr = restarted_producer.communicate(
+                        timeout=30
+                    )
+                    consumer_stdout, consumer_stderr = consumer.communicate(timeout=30)
+                    self.assertEqual(restarted_producer.returncode, 0, producer_stderr)
+                    self.assertEqual(consumer.returncode, 0, consumer_stderr)
+                    self.assertIn("total_messages_sent=1", producer_stdout)
+                    self.assertIn("total_messages_received=1", consumer_stdout)
+            finally:
+                if consumer is not None and consumer.poll() is None:
+                    consumer.kill()
+                    consumer.communicate()
+        finally:
+            if first_producer.poll() is None:
+                first_producer.kill()
+                first_producer.communicate()
+            if restarted_producer is not None and restarted_producer.poll() is None:
+                restarted_producer.kill()
+                restarted_producer.communicate()
 
     def test_fixed_payloads_are_written_only_to_file_and_transfer_stats_match(self):
         messages = 5

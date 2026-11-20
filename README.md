@@ -81,6 +81,15 @@ IPC mechanism for a production system.
   waits for the consumer to drain the shared-memory ring. The consumer flushes
   queued file output before exiting and reports both ring-drain and total
   throughput.
+- `SIGINT` and `SIGTERM` stop production and let an attached consumer drain the
+  ring and flush its output before the producer exits. If no consumer connects
+  within three seconds, or an attached consumer does not finish within thirty
+  seconds, the producer reports incomplete shutdown and exits rather than
+  waiting indefinitely. After opening the queue, the consumer also gives the
+  notification handoff three seconds to complete, so it does not retry forever
+  if the producer exits during startup. The consumer handles signals during
+  startup and handoff; during a transfer it drains the producer's queue before
+  exiting with the corresponding signal status.
 
 The producer creates both eventfds. For initial setup only, it passes them to
 the consumer using `SCM_RIGHTS` over a local abstract Unix-domain socket. This
@@ -124,7 +133,7 @@ hexadecimal characters per payload byte, so this default run can write about
 `--payload-bytes` to use a fixed payload length (1 through 1,048,576 bytes):
 
 ```sh
-./build/release/producer --messages 100 --payload-bytes 4096
+./build/release/producer --messages 100 --payload-bytes 2024
 ```
 
 `--messages` must be positive. If `--payload-bytes` is omitted, each message
@@ -201,6 +210,9 @@ type or capacity needs a corresponding explicit instantiation.
 
 The sample uses fixed shared-memory, semaphore, and abstract socket names, and
 is intended for one producer/consumer pair at a time. The producer unlinks its
-named shared-memory and semaphore resources during normal cleanup; a forced
-termination can leave names behind and interfere with a later run. The IPC
-setup, `eventfd`, `signalfd`, and `epoll` implementation is Linux-specific.
+named shared-memory and semaphore resources during normal cleanup. `SIGKILL`
+cannot be caught, so it can leave those names behind; when a new producer
+successfully binds the exclusive notification socket, it removes such stale
+names before creating a fresh queue. If the consumer was also left running, it
+must be restarted so it attaches to the new queue. The IPC setup, `eventfd`,
+`signalfd`, and `epoll` implementation is Linux-specific.

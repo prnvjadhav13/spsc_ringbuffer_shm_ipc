@@ -3,7 +3,6 @@
 ## Project overview
 
 **Project:** Linux Shared-Memory IPC Framework Using Lock-Free SPSC Ring Buffer  
-**GitHub:** [**https://lnkd.in/dEMsEBEk**](https://www.linkedin.com/safety/go/?url=https%3A%2F%2Flnkd%2Ein%2FdEMsEBEk&urlhash=wSvy&mt=2HUu9rUeju7yp-KZgmODUQOk2ETqZvTKr6uKIA3rD3XPW_C2pzCpKUVDTuxzC5N7GVBPsS7pIhhPW1Ity3KgmydYfXht2xsyN8_RqbK1VG_JA5snkS0PULJhCfgmf3xGfOywmJKU9S2zg9XWm-EvbvAk8MbMB7JmH3HnBkOcXuEAprREjbJ0FRJh-0-GNV2dV1o&isSdui=true)
 
 This C++ sample demonstrates inter-process communication (IPC) between
 independent Linux processes using a lock-free, shared-memory SPSC ring buffer.

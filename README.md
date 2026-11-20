@@ -1,14 +1,50 @@
 # Linux SPSC shared-memory ring buffer for IPC
 
-This repository is a small C++23 example of passing fixed-size records between
-two separate Linux processes with a single-producer/single-consumer (SPSC) ring
-buffer in shared memory. It demonstrates how applications can exchange data
-without sending every record through a socket or another kernel-mediated
-message path. The shared-memory data path avoids kernel copies between
-processes, but this is not end-to-end zero-copy: the producer copies each
-record into the ring, the consumer copies it out, and the consumer writes it
-to its output stream. `mmap`, `eventfd`, and the initial descriptor handoff
-still use Linux kernel facilities.
+## Project overview
+
+**Project:** Linux Shared-Memory IPC Framework Using Lock-Free SPSC Ring Buffer  
+**GitHub:** [**https://lnkd.in/dEMsEBEk**](https://www.linkedin.com/safety/go/?url=https%3A%2F%2Flnkd%2Ein%2FdEMsEBEk&urlhash=wSvy&mt=2HUu9rUeju7yp-KZgmODUQOk2ETqZvTKr6uKIA3rD3XPW_C2pzCpKUVDTuxzC5N7GVBPsS7pIhhPW1Ity3KgmydYfXht2xsyN8_RqbK1VG_JA5snkS0PULJhCfgmf3xGfOywmJKU9S2zg9XWm-EvbvAk8MbMB7JmH3HnBkOcXuEAprREjbJ0FRJh-0-GNV2dV1o&isSdui=true)
+
+This C++ sample demonstrates inter-process communication (IPC) between
+independent Linux processes using a lock-free, shared-memory SPSC ring buffer.
+It combines POSIX shared memory mapped with `mmap(MAP_SHARED)` for the message
+data path with `eventfd` notifications and `epoll` waits. This avoids routing
+each message through a Unix-domain socket or another kernel-mediated
+message-transport path, and avoids kernel-mediated copying of the message
+payload between the processes. It is not end-to-end zero-copy: the producer
+copies each message into the ring and the consumer copies it out.
+
+The ring buffer is templated on message type and capacity. Messages must be
+fixed-size and trivially copyable so both processes can interpret the same
+shared-memory layout. The ring's atomic head and tail indices are separated
+onto cache lines to reduce false sharing; acquire/release ordering coordinates
+the single producer and single consumer without a mutex on the ring data path.
+In this repository, the process-level example uses its configured payload
+record and capacity; adapting the mapping to another type or capacity requires
+matching configuration and template instantiation in both processes.
+
+`eventfd` provides cross-process wakeups, while `epoll` lets the endpoints wait
+for notifications and other registered events rather than busy-polling. A
+second eventfd carries space-available notifications for high/low watermark
+backpressure. Unix-domain sockets are used only during setup to pass the
+eventfd descriptors with `SCM_RIGHTS`; message data stays in shared memory.
+The sample also demonstrates signal handling, completion notification, and
+orderly resource cleanup.
+
+### Key technical highlights
+
+1. A fixed-capacity lock-free SPSC ring with compile-time checks for message
+   constraints and lock-free atomics.
+2. A shared-memory data path established with POSIX shared memory and
+   `mmap(MAP_SHARED)`.
+3. Event-driven notifications using `eventfd`, `epoll`, and `signalfd` for
+   wakeups, event handling, and graceful signal processing.
+4. Producer-consumer flow control with 90% high and 40% low watermarks to
+   apply backpressure.
+5. `SCM_RIGHTS` descriptor passing over a Unix-domain socket for notification
+   setup, without using that socket to carry message payloads.
+6. Linux-native IPC lifecycle handling, including queue completion signaling
+   and cleanup of resources owned by the producer.
 
 The sample transfers random payload messages to show the full
 producer-to-consumer flow. It is an educational starting point for Linux
@@ -22,7 +58,7 @@ IPC mechanism for a production system.
 - The producer creates a POSIX shared-memory object, sizes it for the queue
   layout, and maps it with `mmap(MAP_SHARED)`.
 - The consumer maps the same object. Both processes then access the same ring
-  storage; log records are not sent through the Unix-domain socket.
+  storage; payload messages are not sent through the Unix-domain socket.
 - `SpscRingBuffer<T, Capacity>` uses atomic head and tail indices with
   acquire/release ordering. It has one writer on each side and does not use a
   mutex. Its atomic types are required to be lock-free by compile-time checks.

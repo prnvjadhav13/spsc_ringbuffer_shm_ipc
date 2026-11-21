@@ -5,6 +5,8 @@
 #ifndef _SHM_QUEUE_EVENTFD_HPP
 #define _SHM_QUEUE_EVENTFD_HPP
 
+#include <expected>
+#include <system_error>
 #include <stop_token>
 
 // Move-only owner of one POSIX/Linux file descriptor. Destruction closes the
@@ -34,9 +36,8 @@ struct SharedQueueNotificationFds {
   UniqueFileDescriptor space_available;
 };
 
-// Eventfd operations return zero on success or a negative errno value.
-[[nodiscard]] int notify_eventfd(int fd) noexcept;
-[[nodiscard]] int drain_eventfd(int fd) noexcept;
+[[nodiscard]] std::expected<void, std::error_code> notify_eventfd(int fd) noexcept;
+[[nodiscard]] std::expected<void, std::error_code> drain_eventfd(int fd) noexcept;
 
 // Producer-side eventfd notification transport. It passes a producer-to-
 // consumer queue-ready eventfd and a consumer-to-producer space-available
@@ -48,7 +49,7 @@ class SharedQueueEventFd {
  public:
   SharedQueueEventFd();
 
-  [[nodiscard]] int notify() const noexcept;
+  [[nodiscard]] std::expected<void, std::error_code> notify() const noexcept;
   [[nodiscard]] int space_available_fd() const noexcept;
   void serve_consumers(std::stop_token stop) const;
   static SharedQueueNotificationFds receive(int signal_fd);

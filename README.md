@@ -61,17 +61,19 @@ IPC mechanism for a production system.
 - `SpscRingBuffer<T, Capacity>` uses atomic head and tail indices with
   acquire/release ordering. It has one writer on each side and does not use a
   mutex. Its atomic types are required to be lock-free by compile-time checks.
-- Each fixed-size queue record contains a payload length and up to 1 MiB of
-  random payload data. The example queue holds 2,048 records.
-- After a successful enqueue, the producer signals a nonblocking `eventfd`.
-  The consumer waits for that descriptor with level-triggered `epoll`, drains
-  the notification, then dequeues records until the ring is empty. Eventfd
-  notifications can coalesce; the ring's state, not the eventfd count, is the
-  source of truth for available records.
+- Each fixed-size queue record contains a payload length and up to 2,024 bytes
+  of random payload data. The example queue holds 2,048 cache-line-padded
+  records.
+- The producer batches queue-ready notifications, then signals a nonblocking
+  `eventfd`. The consumer waits for that descriptor with level-triggered
+  `epoll`, drains the notification, then dequeues records until the ring is
+  empty. Eventfd notifications can coalesce; the ring's state, not the eventfd
+  count, is the source of truth for available records.
 - The consumer drains payloads into a bounded in-process queue. A dedicated
-  writer thread converts them to hexadecimal lines in the required
-  `--file-path` output, allowing ring draining to proceed while file output is
-  in progress. Payload data is not printed to the console.
+  writer thread writes them to the required `--file-path` output, allowing ring
+  draining to proceed while file output is in progress. By default, payloads
+  are written as hexadecimal lines; `--binary-output` writes raw payload bytes
+  instead. Payload data is not printed to the console.
 - When queue occupancy reaches the 90% high watermark, the producer pauses.
   As the consumer drains the queue through the 40% low watermark, it signals a
   second eventfd. The producer waits for that notification with `epoll` and
@@ -127,19 +129,29 @@ Its output file is required:
 ```
 
 The producer sends 1,000 messages by default. Payload contents are random and
-payload lengths are randomized from 1 KiB through 1 MiB. The output uses two
-hexadecimal characters per payload byte, so this default run can write about
-1.05 GB to the output file. Use `--messages` to change the message count or
-`--payload-bytes` to use a fixed payload length (1 through 1,048,576 bytes):
+payload lengths are randomized from 1,024 through 2,024 bytes. The output uses
+two hexadecimal characters per payload byte, so this default run writes about
+3 MB to the output file. Use `--messages` to change the message count or
+`--payload-bytes` to use a fixed payload length (1 through 2,024 bytes):
 
 ```sh
 ./build/release/producer --messages 100 --payload-bytes 2024
 ```
 
 `--messages` must be positive. If `--payload-bytes` is omitted, each message
-gets a random payload length from 1,024 through 1,048,576 bytes. The consumer
+gets a random payload length from 1,024 through 2,024 bytes. The consumer
 requires `--file-path` and truncates the named output file before writing lines
-in `event-id:length: [hex-payload]` format.
+in `event-id:length: [hex-payload]` format. Add `--binary-output` to write the
+raw payload bytes concatenated, with no event IDs, lengths, or record
+boundaries. Use a fixed `--payload-bytes` value when record boundaries need to
+be inferred from the binary output.
+
+For a raw binary-output run with fixed-size messages:
+
+```sh
+./build/release/consumer --file-path payloads.bin --binary-output
+./build/release/producer --messages 1000000 --payload-bytes 2024
+```
 
 CLI help is available at both endpoints:
 
@@ -156,7 +168,8 @@ consumer reports the corresponding `total_messages_received` and
 `total_payload_bytes_received` fields, plus the same total elapsed-time and
 rate fields. Payload sizes and readable rates use decimal units (1 kB = 1,000
 bytes); the raw rate is also printed in B/s. Payload byte counts do not include
-record metadata or the larger hexadecimal output representation.
+record metadata or output formatting overhead. In default text mode, each
+payload byte expands to two hexadecimal characters.
 
 The producer's elapsed time starts immediately before it begins producing
 messages and ends after the consumer reports that the shared-memory ring has
@@ -170,7 +183,9 @@ until the shared-memory ring is empty. It also reports total elapsed time and
 transfer rate; these include waiting for input and finishing/flushing the
 hexadecimal file writer. These are end-to-end sample measurements, not isolated
 shared-memory bandwidth benchmarks: payload generation, queueing, scheduling,
-and file output affect the results.
+and file output affect the results. Binary output avoids hexadecimal
+conversion and writes half as many payload-representation bytes, but does not
+remove producer-side random generation or IPC overhead.
 
 The debug binaries are `build/debug/consumer` and `build/debug/producer`; run
 both endpoints from the same build type. Sanitizers add runtime overhead and
@@ -193,6 +208,13 @@ binaries with `make clean`.
 - `log_queue_config.hpp` — `LogEvent`, queue capacity, watermarks, and IPC
   names.
 - `shm_ringbuffer_tests.cpp` — standalone ring-buffer test/example source.
+
+Queue operations use `EnqueueResult` (`enqueued` or `full`) and
+`DequeueResult` (`dequeued` or `empty`), so full/empty are explicit normal
+outcomes rather than generic failures. Interruptible startup and signal waits
+also return named states. Eventfd operations return
+`std::expected<void, std::error_code>`: `has_value()` means success, while
+`error()` identifies the failed system operation.
 
 ## Adapting the queue
 

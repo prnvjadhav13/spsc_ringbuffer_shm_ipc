@@ -15,10 +15,12 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <expected>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <string_view>
 #include <system_error>
@@ -36,17 +38,22 @@ constexpr std::uint32_t kSignalEvent = 2;
 constexpr auto kConsumerAttachGracePeriod = std::chrono::seconds(3);
 constexpr auto kConsumerDrainGracePeriod = std::chrono::seconds(5);
 
-int consume_signal(int signal_fd, int& signal_number) {
+enum class ParseSizeArgumentError { missing_value, invalid_integer };
+
+std::expected<std::optional<int>, std::error_code> consume_signal(int signal_fd) {
   signalfd_siginfo info{};
   ssize_t bytes;
   do {
     bytes = ::read(signal_fd, &info, sizeof(info));
   } while (bytes == -1 && errno == EINTR);
   if (bytes != static_cast<ssize_t>(sizeof(info))) {
-    return bytes == -1 ? -errno : -EIO;
+    if (bytes == -1 && errno == EAGAIN) {
+      return std::nullopt;
+    }
+    return std::unexpected(
+        std::error_code(bytes == -1 ? errno : EIO, std::generic_category()));
   }
-  signal_number = static_cast<int>(info.ssi_signo);
-  return 0;
+  return std::optional<int>(static_cast<int>(info.ssi_signo));
 }
 
 // Register a readable descriptor and its event identifier with epoll.
@@ -124,8 +131,8 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
     }
 
     std::array<epoll_event, 2> ready_events{};
-    const int ready_count = ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(),
-                                         paused_for_watermark ? -1 : 0);
+    const int ready_count = ::epoll_wait(
+        epoll_fd.get(), ready_events.data(), ready_events.size(), paused_for_watermark ? -1 : 0);
     if (ready_count == -1) {
       if (errno == EINTR) {
         continue;
@@ -138,12 +145,13 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
     for (int i = 0; i < ready_count; ++i) {
       const auto& event = ready_events[i];
       if (event.data.u32 == kSignalEvent) {
-        int signal_number = 0;
-        producer_error = consume_signal(signal_fd, signal_number);
-        if (producer_error == 0) {
-          record_signal(signal_number);
-          shutdown_requested = true;
+        const auto signal_result = consume_signal(signal_fd);
+        if (!signal_result) {
+          producer_error = -signal_result.error().value();
+        } else if (signal_result->has_value()) {
+          record_signal(signal_result->value());
         }
+        shutdown_requested = true;
         break;
       }
     }
@@ -157,8 +165,9 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
         break;
       }
       if (event.data.u32 == kSpaceAvailableEvent) {
-        producer_error = drain_eventfd(event_notifications.space_available_fd());
-        if (producer_error != 0) {
+        const auto drain_result = drain_eventfd(event_notifications.space_available_fd());
+        if (!drain_result) {
+          producer_error = -drain_result.error().value();
           break;
         }
         record_consumer_attachment();
@@ -181,7 +190,7 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
         options.payload_bytes == 0 ? random_payload_size(random_engine) : options.payload_bytes;
     fill_random_payload(event, payload_bytes, random_engine);
 
-    if (!mapping.enqueue(event)) {
+    if (mapping.enqueue(event) == EnqueueResult::full) {
       paused_for_watermark = true;
       continue;
     }
@@ -189,11 +198,12 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
     ++event_count;
     payload_total_bytes += event.message_length;
 
-    const int notify_error = event_notifications.notify();
-    if (notify_error != 0) {
-      producer_error = notify_error;
+    const auto notify_result = event_notifications.notify();
+    if (!notify_result) {
+      producer_error = -notify_result.error().value();
       break;
     }
+
     const auto queue_size = mapping.queue_size();
     if (queue_size >= kLogQueueHighWatermark) {
       paused_for_watermark = true;
@@ -201,9 +211,9 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
   }
 
   mapping.mark_producer_done();
-  const int notify_error = event_notifications.notify();
-  if (producer_error == 0 && notify_error != 0) {
-    producer_error = notify_error;
+  const auto notify_result = event_notifications.notify();
+  if (producer_error == 0 && !notify_result) {
+    producer_error = -notify_result.error().value();
   }
 
   while (producer_error == 0 && !mapping.consumer_done()) {
@@ -240,10 +250,11 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
 
     for (int i = 0; i < ready_count; ++i) {
       if (ready_events[i].data.u32 == kSignalEvent) {
-        int signal_number = 0;
-        producer_error = consume_signal(signal_fd, signal_number);
-        if (producer_error == 0) {
-          record_signal(signal_number);
+        const auto signal_result = consume_signal(signal_fd);
+        if (!signal_result) {
+          producer_error = -signal_result.error().value();
+        } else if (signal_result->has_value()) {
+          record_signal(signal_result->value());
         }
         break;
       }
@@ -262,8 +273,9 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
           producer_error = -EIO;
           break;
         }
-        producer_error = drain_eventfd(event_notifications.space_available_fd());
-        if (producer_error != 0) {
+        const auto drain_result = drain_eventfd(event_notifications.space_available_fd());
+        if (!drain_result) {
+          producer_error = -drain_result.error().value();
           break;
         }
         record_consumer_attachment();
@@ -275,12 +287,13 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
   }
 
   if (received_signal == 0) {
-    int signal_number = 0;
-    const int signal_error = consume_signal(signal_fd, signal_number);
-    if (signal_error == 0) {
-      record_signal(signal_number);
-    } else if (signal_error != -EAGAIN && producer_error == 0) {
-      producer_error = signal_error;
+    const auto signal_result = consume_signal(signal_fd);
+    if (!signal_result) {
+      if (producer_error == 0) {
+        producer_error = -signal_result.error().value();
+      }
+    } else if (signal_result->has_value()) {
+      record_signal(signal_result->value());
     }
   }
 
@@ -348,22 +361,20 @@ void print_producer_help(const char* program) {
             << "  --help             Show this help.\n";
 }
 
-bool parse_size_argument(int argc, char* argv[], int& index, const char* name,
-                         std::size_t& value) {
+std::expected<void, ParseSizeArgumentError> parse_size_argument(
+    int argc, char* argv[], int& index, std::size_t& value) {
   if (index + 1 >= argc) {
-    std::cerr << "Missing value for " << name << ".\n";
-    return false;
+    return std::unexpected(ParseSizeArgumentError::missing_value);
   }
   const std::string_view input(argv[index + 1]);
   std::size_t parsed{};
   const auto [end, error] = std::from_chars(input.data(), input.data() + input.size(), parsed);
   if (error != std::errc{} || end != input.data() + input.size()) {
-    std::cerr << "Invalid non-negative integer for " << name << ": " << input << ".\n";
-    return false;
+    return std::unexpected(ParseSizeArgumentError::invalid_integer);
   }
   value = parsed;
   ++index;
-  return true;
+  return {};
 }
 
 // Initialize IPC, transfer random payloads, and wait for consumer completion.
@@ -384,7 +395,14 @@ int main(int argc, char* argv[]) {
           return 2;
         }
         messages_option_seen = true;
-        if (!parse_size_argument(argc, argv, i, "--messages", options.messages)) {
+        const auto parse_result = parse_size_argument(argc, argv, i, options.messages);
+        if (!parse_result) {
+          if (parse_result.error() == ParseSizeArgumentError::missing_value) {
+            std::cerr << "Missing value for --messages.\n";
+          } else {
+            std::cerr << "Invalid non-negative integer for --messages: " << argv[i + 1]
+                      << ".\n";
+          }
           return 2;
         }
       } else if (argument == "--payload-bytes") {
@@ -393,7 +411,14 @@ int main(int argc, char* argv[]) {
           return 2;
         }
         payload_option_seen = true;
-        if (!parse_size_argument(argc, argv, i, "--payload-bytes", options.payload_bytes)) {
+        const auto parse_result = parse_size_argument(argc, argv, i, options.payload_bytes);
+        if (!parse_result) {
+          if (parse_result.error() == ParseSizeArgumentError::missing_value) {
+            std::cerr << "Missing value for --payload-bytes.\n";
+          } else {
+            std::cerr << "Invalid non-negative integer for --payload-bytes: " << argv[i + 1]
+                      << ".\n";
+          }
           return 2;
         }
       } else {

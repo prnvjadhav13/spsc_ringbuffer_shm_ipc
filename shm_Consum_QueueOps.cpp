@@ -42,6 +42,8 @@ constexpr char kHexDigits[] = "0123456789abcdef";
 constexpr std::size_t kPayloadWriterQueueCapacity = kLogQueueCapacity / 2;
 constexpr std::size_t kSignalCheckBatchSize = 64;
 
+enum class QueuePushResult { pushed, closed };
+
 std::optional<int> read_signal(int signal_fd) {
   signalfd_siginfo signal_info{};
   for (;;) {
@@ -78,15 +80,23 @@ void write_payload_hex(std::ostream& output, const LogEvent& message,
   output.write(encoded_payload.data(), static_cast<std::streamsize>(encoded_payload.size()));
 }
 
+void write_payload_binary(std::ostream& output, const LogEvent& message) {
+  output.write(reinterpret_cast<const char*>(message.payload),
+               static_cast<std::streamsize>(message.message_length));
+}
+
 class BoundedLogEventQueue {
  public:
   explicit BoundedLogEventQueue(std::size_t capacity) : slots_(capacity) {}
 
-  bool push(const LogEvent& message) {
+  QueuePushResult push(const LogEvent& message) {
     std::unique_lock lock(mutex_);
+    if (closed_) {
+      return QueuePushResult::closed;
+    }
     queue_not_full_.wait(lock, [this] { return count_ < slots_.size() || closed_; });
     if (closed_) {
-      return false;
+      return QueuePushResult::closed;
     }
 
     slots_[write_index_] = message;
@@ -94,14 +104,17 @@ class BoundedLogEventQueue {
     ++count_;
     lock.unlock();
     queue_not_empty_.notify_one();
-    return true;
+    return QueuePushResult::pushed;
   }
 
-  const LogEvent* front() {
+  std::optional<std::reference_wrapper<const LogEvent>> front() {
     std::unique_lock lock(mutex_);
     queue_not_empty_.wait(lock, [this] { return count_ != 0 || closed_; });
     // Keep this slot occupied until pop_front while the writer reads it unlocked.
-    return count_ == 0 ? nullptr : &slots_[read_index_];
+    if (count_ == 0) {
+      return std::nullopt;
+    }
+    return std::cref(slots_[read_index_]);
   }
 
   void pop_front() {
@@ -159,12 +172,17 @@ class PayloadWriterThread {
 
 void payload_writer_thread(BoundedLogEventQueue& queue, std::ostream& output,
                            const char* output_path, std::string& encoded_payload,
-                           std::atomic<bool>& output_ok, std::exception_ptr& writer_error) {
+                           bool binary_output, std::atomic<bool>& output_ok,
+                           std::exception_ptr& writer_error) {
   bool writer_failed = false;
-  while (const LogEvent* message = queue.front()) {
+  while (const auto message = queue.front()) {
     if (!writer_failed && output_ok.load(std::memory_order_relaxed)) {
       try {
-        write_payload_hex(output, *message, encoded_payload);
+        if (binary_output) {
+          write_payload_binary(output, message->get());
+        } else {
+          write_payload_hex(output, message->get(), encoded_payload);
+        }
         if (!output) {
           throw std::runtime_error(std::string("Failed while writing payload data to: ") +
                                    output_path);
@@ -195,7 +213,9 @@ void payload_writer_thread(BoundedLogEventQueue& queue, std::ostream& output,
 void print_consumer_help(const char* program) {
   std::cout << "Usage: " << program << " --file-path output-file [--help]\n\n"
             << "  --file-path output-file  Required destination for received payloads "
-               "(event-id:length: [hex payload], one per line).\n"
+               "(text hex format by default).\n"
+            << "  --binary-output         Write raw payload bytes concatenated, without "
+               "record boundaries.\n"
             << "  --help                   Show this help.\n";
 }
 
@@ -204,11 +224,20 @@ void print_consumer_help(const char* program) {
 // Drain payload messages into a bounded writer queue and report transfer totals.
 int main(int argc, char* argv[]) {
   const char* output_path = nullptr;
+  bool binary_output = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view argument(argv[i]);
     if (argument == "--help" || argument == "-h") {
       print_consumer_help(argv[0]);
       return 0;
+    }
+    if (argument == "--binary-output") {
+      if (binary_output) {
+        std::cerr << "Option specified more than once: --binary-output.\n";
+        return 2;
+      }
+      binary_output = true;
+      continue;
     }
     if (argument != "--file-path") {
       std::cerr << "Unknown argument: " << argument << '\n';
@@ -246,7 +275,9 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  std::ofstream output_file(output_path, std::ios::out | std::ios::trunc);
+  const auto output_mode = std::ios::out | std::ios::trunc |
+                           (binary_output ? std::ios::binary : std::ios::openmode{});
+  std::ofstream output_file(output_path, output_mode);
   if (!output_file) {
     std::cerr << "Could not open payload output file: " << output_path << '\n';
     return 1;
@@ -254,11 +285,12 @@ int main(int argc, char* argv[]) {
 
   try {
     SharedLogQueueMapping<LogEvent, kLogQueueCapacity> mapping;
-    if (!mapping.open_shared_memory_ring_buffer(signal_fd.get())) {
+    if (mapping.open_shared_memory_ring_buffer(signal_fd.get()) ==
+        QueueStartupResult::interrupted) {
       const auto signal = read_signal(signal_fd.get());
       return signal ? 128 + *signal : 1;
     }
-    if (!mapping.wait_until_ready(signal_fd.get())) {
+    if (mapping.wait_until_ready(signal_fd.get()) == QueueStartupResult::interrupted) {
       const auto signal = read_signal(signal_fd.get());
       return signal ? 128 + *signal : 1;
     }
@@ -293,16 +325,18 @@ int main(int argc, char* argv[]) {
 
     BoundedLogEventQueue writer_queue(kPayloadWriterQueueCapacity);
     std::string encoded_payload;
-    encoded_payload.reserve(2 * kLogMessageSize + 64);
+    if (!binary_output) {
+      encoded_payload.reserve(2 * kLogMessageSize + 64);
+    }
     std::atomic<bool> output_ok{true};
     std::exception_ptr writer_error;
     std::thread writer(payload_writer_thread, std::ref(writer_queue), std::ref(output_file),
-                       output_path, std::ref(encoded_payload), std::ref(output_ok),
-                       std::ref(writer_error));
+                       output_path, std::ref(encoded_payload), binary_output,
+                       std::ref(output_ok), std::ref(writer_error));
     PayloadWriterThread writer_thread(writer_queue, std::move(writer));
-    const int attach_notify_error = notify_eventfd(notification_fds.space_available.get());
-    if (attach_notify_error != 0) {
-      throw std::system_error(-attach_notify_error, std::generic_category(),
+    const auto attach_notify_result = notify_eventfd(notification_fds.space_available.get());
+    if (!attach_notify_result) {
+      throw std::system_error(attach_notify_result.error(),
                               "notify producer of consumer attachment");
     }
 
@@ -342,38 +376,36 @@ int main(int argc, char* argv[]) {
         continue;
       }
 
-      const int drain_error = drain_eventfd(notification_fds.queue_ready.get());
-      if (drain_error != 0) {
-        throw std::system_error(-drain_error, std::generic_category(),
-                                "drain queue notification");
+      const auto drain_result = drain_eventfd(notification_fds.queue_ready.get());
+      if (!drain_result) {
+        throw std::system_error(drain_result.error(), "drain queue notification");
       }
 
-      LogEvent message{};
       std::size_t messages_since_signal_check = 0;
-      while (mapping.dequeue(message)) {
+      LogEvent message{};
+      while (mapping.dequeue(message) == DequeueResult::dequeued) {
         const std::size_t queue_size = mapping.queue_size();
+
         if (message.message_length == 0 || message.message_length > kLogMessageSize) {
           std::cerr << "Received invalid payload length: " << message.message_length << ".\n";
           output_ok.store(false, std::memory_order_relaxed);
+        } else if (message.message_length >
+                   std::numeric_limits<std::uint64_t>::max() - payload_total_bytes) {
+          std::cerr << "Payload byte total exceeds the supported range.\n";
+          output_ok.store(false, std::memory_order_relaxed);
         } else {
-          if (message.message_length >
-              std::numeric_limits<std::uint64_t>::max() - payload_total_bytes) {
-            std::cerr << "Payload byte total exceeds the supported range.\n";
-            output_ok.store(false, std::memory_order_relaxed);
-          } else {
-            ++messages_received;
-            payload_total_bytes += message.message_length;
-            if (!writer_queue.push(message)) {
-              throw std::runtime_error("Payload writer queue closed before transfer completed");
-            }
+          ++messages_received;
+          payload_total_bytes += message.message_length;
+          if (writer_queue.push(message) == QueuePushResult::closed) {
+            throw std::runtime_error("Payload writer queue closed before transfer completed");
           }
         }
 
         if (queue_size != 0 && queue_size <= kLogQueueLowWatermark) {
-          const int notify_error = notify_eventfd(notification_fds.space_available.get());
-          if (notify_error != 0) {
-            std::cerr << "Space-available notification failed: " << std::strerror(-notify_error)
-                      << ".\n";
+          const auto notify_result = notify_eventfd(notification_fds.space_available.get());
+          if (!notify_result) {
+            std::cerr << "Space-available notification failed: "
+                      << notify_result.error().message() << ".\n";
             output_ok.store(false, std::memory_order_relaxed);
           }
         }
@@ -405,10 +437,10 @@ int main(int argc, char* argv[]) {
           received_signal = *signal;
         }
         mapping.mark_consumer_done();
-        const int notify_error = notify_eventfd(notification_fds.space_available.get());
-        if (notify_error != 0) {
+        const auto notify_result = notify_eventfd(notification_fds.space_available.get());
+        if (!notify_result) {
           std::cerr << "Consumer-completion notification failed: "
-                    << std::strerror(-notify_error) << ".\n";
+                    << notify_result.error().message() << ".\n";
           output_ok.store(false, std::memory_order_relaxed);
         }
         break;

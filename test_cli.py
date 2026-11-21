@@ -74,13 +74,18 @@ def parse_payload_byte_total(value):
     return int(match.group(1))
 
 
-def run_transfer(messages, payload_bytes=None, initial_output=None):
+def run_transfer(messages, payload_bytes=None, initial_output=None, binary_output=False):
     with tempfile.TemporaryDirectory() as working_directory:
-        output_path = pathlib.Path(working_directory) / "payloads.hex"
+        output_path = pathlib.Path(working_directory) / (
+            "payloads.bin" if binary_output else "payloads.hex"
+        )
         if initial_output is not None:
             output_path.write_text(initial_output)
+        consumer_arguments = [str(CONSUMER), "--file-path", str(output_path)]
+        if binary_output:
+            consumer_arguments.append("--binary-output")
         consumer = subprocess.Popen(
-            [str(CONSUMER), "--file-path", str(output_path)],
+            consumer_arguments,
             cwd=working_directory,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -107,8 +112,12 @@ def run_transfer(messages, payload_bytes=None, initial_output=None):
                     consumer.kill()
                     consumer.communicate()
 
-        payload_lines = output_path.read_text().splitlines()
-    return producer, consumer.returncode, consumer_stdout, consumer_stderr, payload_lines
+        payload_output = (
+            output_path.read_bytes()
+            if binary_output
+            else output_path.read_text().splitlines()
+        )
+    return producer, consumer.returncode, consumer_stdout, consumer_stderr, payload_output
 
 
 class TransferCliTests(unittest.TestCase):
@@ -123,6 +132,7 @@ class TransferCliTests(unittest.TestCase):
         consumer_help = run_cli(CONSUMER, "--help")
         self.assertEqual(consumer_help.returncode, 0, consumer_help.stderr)
         self.assertIn("--file-path output-file", consumer_help.stdout)
+        self.assertIn("--binary-output", consumer_help.stdout)
 
     def test_invalid_cli_options_fail_before_startup(self):
         for arguments, expected_error in (
@@ -424,6 +434,23 @@ class TransferCliTests(unittest.TestCase):
                         rel_tol=0.01,
                     )
                 )
+
+    def test_binary_output_contains_only_concatenated_payload_bytes(self):
+        messages = 5
+        payload_bytes = 64
+        producer, consumer_status, consumer_stdout, consumer_stderr, payload_output = (
+            run_transfer(messages, payload_bytes, binary_output=True)
+        )
+
+        self.assertEqual(producer.returncode, 0, producer.stderr)
+        self.assertEqual(consumer_status, 0, consumer_stderr)
+        self.assertEqual(len(payload_output), messages * payload_bytes)
+        self.assertEqual(
+            parse_payload_byte_total(
+                summary_values(consumer_stdout)["total_payload_bytes_received"]
+            ),
+            len(payload_output),
+        )
 
     def test_payload_byte_summary_includes_decimal_size(self):
         producer, consumer_status, consumer_stdout, consumer_stderr, _ = run_transfer(

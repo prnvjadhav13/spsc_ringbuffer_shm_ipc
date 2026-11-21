@@ -107,9 +107,10 @@ void SharedLogQueueMapping<T, Capacity>::create_shared_memory_ring_buffer() {
   role_ = Role::producer;
 }
 
-// Wait for shared memory, map and validate its layout; return false if startup is interrupted.
+// Wait for shared memory and validate its layout; report when startup is interrupted.
 template <typename T, std::size_t Capacity>
-bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int signal_fd) {
+QueueStartupResult SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(
+    int signal_fd) {
   if (mapping_ != nullptr || fd_ != -1 || ready_ != SEM_FAILED) {
     throw std::logic_error("SharedLogQueueMapping is already open");
   }
@@ -123,8 +124,9 @@ bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int sign
     if (errno != ENOENT) {
       throw_errno("shm_open");
     }
-    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(100))) {
-      return false;
+    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(100)) ==
+        SignalWaitResult::signal_received) {
+      return QueueStartupResult::interrupted;
     }
   }
 
@@ -144,8 +146,9 @@ bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int sign
     if (errno != EAGAIN && errno != EINTR) {
       throw_errno("sem_trywait readiness");
     }
-    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50))) {
-      return false;
+    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50)) ==
+        SignalWaitResult::signal_received) {
+      return QueueStartupResult::interrupted;
     }
   }
 
@@ -160,8 +163,9 @@ bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int sign
     if (info.st_size != 0) {
       throw std::runtime_error("Shared-memory segment size does not match queue configuration");
     }
-    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50))) {
-      return false;
+    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50)) ==
+        SignalWaitResult::signal_received) {
+      return QueueStartupResult::interrupted;
     }
   }
 
@@ -179,19 +183,19 @@ bool SharedLogQueueMapping<T, Capacity>::open_shared_memory_ring_buffer(int sign
     throw std::runtime_error("Shared-memory queue metadata does not match queue configuration");
   }
   role_ = Role::consumer;
-  return true;
+  return QueueStartupResult::ready;
 }
 
-// Enqueue as the producer; return false when the ring buffer is full.
+// Enqueue as the producer and distinguish a full queue from a successful enqueue.
 template <typename T, std::size_t Capacity>
-bool SharedLogQueueMapping<T, Capacity>::enqueue(const T& message) {
+EnqueueResult SharedLogQueueMapping<T, Capacity>::enqueue(const T& message) {
   require_role(Role::producer, "enqueue");
   return shared_->ring.EnQueue(message);
 }
 
-// Dequeue as the consumer; return false when the ring buffer is empty.
+// Dequeue as the consumer and distinguish an empty queue from a successful dequeue.
 template <typename T, std::size_t Capacity>
-bool SharedLogQueueMapping<T, Capacity>::dequeue(T& message) {
+DequeueResult SharedLogQueueMapping<T, Capacity>::dequeue(T& message) {
   require_role(Role::consumer, "dequeue");
   return shared_->ring.DeQueue(message);
 }
@@ -245,9 +249,9 @@ void SharedLogQueueMapping<T, Capacity>::post_ready() const {
   }
 }
 
-// Poll readiness without consuming it; return false if a shutdown signal arrives.
+// Poll readiness without consuming it; report when a shutdown signal interrupts startup.
 template <typename T, std::size_t Capacity>
-bool SharedLogQueueMapping<T, Capacity>::wait_until_ready(int signal_fd) const {
+QueueStartupResult SharedLogQueueMapping<T, Capacity>::wait_until_ready(int signal_fd) const {
   require_role(Role::consumer, "wait for queue readiness");
   if (ready_ == SEM_FAILED) {
     throw std::logic_error("Shared-memory semaphore is not open");
@@ -260,10 +264,11 @@ bool SharedLogQueueMapping<T, Capacity>::wait_until_ready(int signal_fd) const {
       throw_errno("sem_getvalue");
     }
     if (value > 0) {
-      return true;
+      return QueueStartupResult::ready;
     }
-    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50))) {
-      return false;
+    if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50)) ==
+        SignalWaitResult::signal_received) {
+      return QueueStartupResult::interrupted;
     }
   }
 }

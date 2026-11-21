@@ -14,6 +14,8 @@
 #include "log_queue_config.hpp"
 #include "shared_queue_storage.hpp"
 
+enum class QueueStartupResult { ready, interrupted };
+
 // Per-process RAII handle for a shared SPSC queue. It owns this process's
 // mapping, file descriptor, semaphore handles, and (for the producer) the
 // names it created; it does not exclusively own the queue shared with peers.
@@ -39,16 +41,16 @@ class SharedLogQueueMapping {
   SharedLogQueueMapping& operator=(SharedLogQueueMapping&& other) noexcept;
 
   void create_shared_memory_ring_buffer();
-  bool open_shared_memory_ring_buffer(int signal_fd);
-  [[nodiscard]] bool enqueue(const T& message);
-  [[nodiscard]] bool dequeue(T& message);
+  QueueStartupResult open_shared_memory_ring_buffer(int signal_fd);
+  [[nodiscard]] EnqueueResult enqueue(const T& message);
+  [[nodiscard]] DequeueResult dequeue(T& message);
   [[nodiscard]] std::size_t queue_size() const;
   void mark_producer_done();
   [[nodiscard]] bool producer_done() const;
   void mark_consumer_done();
   [[nodiscard]] bool consumer_done() const;
   void post_ready() const;
-  bool wait_until_ready(int signal_fd) const;
+  QueueStartupResult wait_until_ready(int signal_fd) const;
 
  private:
   enum class Role { none, producer, consumer };

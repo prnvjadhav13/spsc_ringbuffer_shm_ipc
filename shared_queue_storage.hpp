@@ -13,7 +13,7 @@
 #include "spsc_ringbuffer.hpp"
 
 inline constexpr std::uint64_t kSharedQueueMagic = 0x5348515545554531ULL;
-inline constexpr std::uint32_t kSharedQueueVersion = 4;
+inline constexpr std::uint32_t kSharedQueueVersion = 5;
 
 // In-place shared-memory layout for one SPSC queue. It stores compatibility
 // metadata, the ring buffer, and endpoint status flags; it owns no OS handles

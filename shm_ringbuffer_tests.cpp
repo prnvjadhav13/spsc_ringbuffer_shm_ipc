@@ -23,7 +23,7 @@ bool test_RingBuffer(int number) {
   // Dequeue one item and verify that it matches the next expected FIFO value.
   const auto dequeue_expected = [&]() {
     int value = 0;
-    if (!ringbuffer.DeQueue(value)) {
+    if (ringbuffer.DeQueue(value) != DequeueResult::dequeued) {
       std::cerr << "Dequeue failed while expecting " << expected << ".\n";
       return false;
     }
@@ -40,11 +40,11 @@ bool test_RingBuffer(int number) {
 
   for (std::int64_t value = 1; value <= number; ++value) {
     const int item = static_cast<int>(value);
-    if (!ringbuffer.EnQueue(item)) {
+    if (ringbuffer.EnQueue(item) == EnqueueResult::full) {
       if (!dequeue_expected()) {
         return false;
       }
-      if (!ringbuffer.EnQueue(item)) {
+      if (ringbuffer.EnQueue(item) != EnqueueResult::enqueued) {
         std::cerr << "Enqueue failed after making queue space.\n";
         return false;
       }
@@ -84,7 +84,7 @@ int main() {
     }
     message.length = static_cast<std::uint32_t>(text.size());
     std::memcpy(message.text, text.data(), message.length);
-    if (!ringbuffer.EnQueue(std::move(message))) {
+    if (ringbuffer.EnQueue(std::move(message)) == EnqueueResult::full) {
       std::cerr << "Message enqueue failed: queue is full.\n";
       std::cerr << "Message enqueue failed:" << message.text << std::endl;
 
@@ -93,7 +93,7 @@ int main() {
   }
 
   Message output{};
-  while (ringbuffer.DeQueue(output)) {
+  while (ringbuffer.DeQueue(output) == DequeueResult::dequeued) {
     std::cout << "Dequeued: ";
     std::cout.write(output.text, output.length);
     std::cout << '\n';

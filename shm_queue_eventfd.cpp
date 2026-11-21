@@ -196,29 +196,29 @@ void UniqueFileDescriptor::reset(int fd) noexcept {
   fd_ = fd;
 }
 
-// Increment the eventfd counter; return zero on success or saturation, otherwise negative errno.
-int notify_eventfd(int fd) noexcept {
+// Increment the eventfd counter; saturation is successful because a wakeup is already pending.
+std::expected<void, std::error_code> notify_eventfd(int fd) noexcept {
   constexpr std::uint64_t increment = 1;
   for (;;) {
     const auto written = ::write(fd, &increment, sizeof(increment));
     if (written == static_cast<ssize_t>(sizeof(increment))) {
-      return 0;
+      return {};
     }
     if (written == -1 && errno == EINTR) {
       continue;
     }
     if (written == -1 && errno == EAGAIN) {
-      return 0;
+      return {};
     }
     if (written == -1) {
-      return -errno;
+      return std::unexpected(std::error_code(errno, std::generic_category()));
     }
-    return -EIO;
+    return std::unexpected(std::error_code(EIO, std::generic_category()));
   }
 }
 
-// Read a nonblocking eventfd until empty; return zero or a negative errno on failure.
-int drain_eventfd(int fd) noexcept {
+// Read a nonblocking eventfd until empty; an empty counter is a successful drain.
+std::expected<void, std::error_code> drain_eventfd(int fd) noexcept {
   for (;;) {
     std::uint64_t value = 0;
     const auto bytes_read = ::read(fd, &value, sizeof(value));
@@ -229,12 +229,12 @@ int drain_eventfd(int fd) noexcept {
       continue;
     }
     if (bytes_read == -1 && errno == EAGAIN) {
-      return 0;
+      return {};
     }
     if (bytes_read == -1) {
-      return -errno;
+      return std::unexpected(std::error_code(errno, std::generic_category()));
     }
-    return -EIO;
+    return std::unexpected(std::error_code(EIO, std::generic_category()));
   }
 }
 
@@ -246,7 +246,7 @@ SharedQueueEventFd::SharedQueueEventFd()
 }
 
 // Signal that queue data or producer completion is available for the consumer.
-int SharedQueueEventFd::notify() const noexcept {
+std::expected<void, std::error_code> SharedQueueEventFd::notify() const noexcept {
   return notify_eventfd(queue_ready_fd_.get());
 }
 
@@ -304,7 +304,8 @@ SharedQueueNotificationFds SharedQueueEventFd::receive(int signal_fd) {
         if (std::chrono::steady_clock::now() >= connect_deadline) {
           return {UniqueFileDescriptor{}, UniqueFileDescriptor{}};
         }
-        if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50))) {
+        if (wait_for_signal_or_timeout(signal_fd, std::chrono::milliseconds(50)) ==
+            SignalWaitResult::signal_received) {
           return {UniqueFileDescriptor{}, UniqueFileDescriptor{}};
         }
         continue;

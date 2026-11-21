@@ -13,10 +13,13 @@
 #include <stdexcept>
 #include <system_error>
 
-// Wait for the supplied signalfd to become readable. Returns true when a
-// signal is pending, false on timeout, and throws for invalid descriptors or
-// polling errors; it does not consume the signal.
-inline bool wait_for_signal_or_timeout(int signal_fd, std::chrono::milliseconds timeout) {
+enum class SignalWaitResult { signal_received, timed_out };
+
+// Wait for the supplied signalfd to become readable. Distinguishes a pending
+// signal from timeout, throws for invalid descriptors or polling errors, and
+// does not consume the signal.
+inline SignalWaitResult wait_for_signal_or_timeout(int signal_fd,
+                                                   std::chrono::milliseconds timeout) {
   if (signal_fd < 0) {
     throw std::invalid_argument("signalfd must be a valid file descriptor");
   }
@@ -30,7 +33,7 @@ inline bool wait_for_signal_or_timeout(int signal_fd, std::chrono::milliseconds 
   for (;;) {
     const int ready = ::poll(&descriptor, 1, static_cast<int>(timeout.count()));
     if (ready == 0) {
-      return false;
+      return SignalWaitResult::timed_out;
     }
     if (ready == -1) {
       if (errno == EINTR) {
@@ -39,7 +42,7 @@ inline bool wait_for_signal_or_timeout(int signal_fd, std::chrono::milliseconds 
       throw std::system_error(errno, std::generic_category(), "poll signalfd");
     }
     if (descriptor.revents & POLLIN) {
-      return true;
+      return SignalWaitResult::signal_received;
     }
     throw std::system_error(descriptor.revents & POLLNVAL ? EBADF : EIO, std::generic_category(),
                             "poll signalfd");

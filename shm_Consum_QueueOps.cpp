@@ -39,7 +39,7 @@ namespace {
 constexpr std::uint32_t kEpollEventQueue = 1;
 constexpr std::uint32_t kEpollEventSignal = 2;
 constexpr char kHexDigits[] = "0123456789abcdef";
-constexpr std::size_t kPayloadWriterQueueCapacity = kLogQueueCapacity / 2;
+constexpr std::size_t kPayloadWriterQueueCapacity = kLogQueueCapacity;
 constexpr std::size_t kSignalCheckBatchSize = 64;
 
 enum class QueuePushResult { pushed, closed };
@@ -100,6 +100,24 @@ class BoundedLogEventQueue {
     }
 
     slots_[write_index_] = message;
+    write_index_ = (write_index_ + 1) % slots_.size();
+    ++count_;
+    lock.unlock();
+    queue_not_empty_.notify_one();
+    return QueuePushResult::pushed;
+  }
+
+  QueuePushResult push(LogEvent&& message) {
+    std::unique_lock lock(mutex_);
+    if (closed_) {
+      return QueuePushResult::closed;
+    }
+    queue_not_full_.wait(lock, [this] { return count_ < slots_.size() || closed_; });
+    if (closed_) {
+      return QueuePushResult::closed;
+    }
+
+    slots_[write_index_] = std::move(message);
     write_index_ = (write_index_ + 1) % slots_.size();
     ++count_;
     lock.unlock();
@@ -382,9 +400,9 @@ int main(int argc, char* argv[]) {
       }
 
       std::size_t messages_since_signal_check = 0;
-      LogEvent message{};
-      while (mapping.dequeue(message) == DequeueResult::dequeued) {
+      while (mapping.queue_size() != 0) {
         const std::size_t queue_size = mapping.queue_size();
+        const LogEvent& message = mapping.front();
 
         if (message.message_length == 0 || message.message_length > kLogMessageSize) {
           std::cerr << "Received invalid payload length: " << message.message_length << ".\n";
@@ -409,6 +427,8 @@ int main(int argc, char* argv[]) {
             output_ok.store(false, std::memory_order_relaxed);
           }
         }
+
+        mapping.pop_front();
 
         if (++messages_since_signal_check == kSignalCheckBatchSize) {
           messages_since_signal_check = 0;

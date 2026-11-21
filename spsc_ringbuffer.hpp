@@ -96,6 +96,34 @@ class SpscRingBuffer {
     return DequeueResult::dequeued;
   }
 
+  [[nodiscard]] T& front() noexcept {
+    const auto head = head_.load(std::memory_order_relaxed);
+    const auto tail = tail_.load(std::memory_order_acquire);
+    assert(tail >= head);
+    assert(tail != head);
+    (void)tail;
+    return buffer_[head % Capacity].value;
+  }
+
+  [[nodiscard]] const T& front() const noexcept {
+    const auto head = head_.load(std::memory_order_relaxed);
+    const auto tail = tail_.load(std::memory_order_acquire);
+    assert(tail >= head);
+    assert(tail != head);
+    (void)tail;
+    return buffer_[head % Capacity].value;
+  }
+
+  void pop_front() noexcept {
+    const auto head = head_.load(std::memory_order_relaxed);
+    const auto tail = tail_.load(std::memory_order_acquire);
+    assert(tail >= head);
+    if (tail == head) {
+      return;
+    }
+    head_.store(head + 1, std::memory_order_release);
+  }
+
   [[nodiscard]] bool IsEmpty() const noexcept {
     return (Size() == 0);
   }
@@ -153,6 +181,34 @@ class SPSCQueue {
     item = std::move(data_[front % Capacity].value);
     front_.store(front + 1, std::memory_order_release);
     return DequeueResult::dequeued;
+  }
+
+  T& front() noexcept {
+    const auto front = front_.load(std::memory_order_relaxed);
+    const auto rear = rear_.load(std::memory_order_acquire);
+    assert(rear >= front);
+    assert(rear != front);
+    (void)rear;
+    return data_[front % Capacity].value;
+  }
+
+  const T& front() const noexcept {
+    const auto front = front_.load(std::memory_order_relaxed);
+    const auto rear = rear_.load(std::memory_order_acquire);
+    assert(rear >= front);
+    assert(rear != front);
+    (void)rear;
+    return data_[front % Capacity].value;
+  }
+
+  void pop_front() noexcept {
+    const auto front = front_.load(std::memory_order_relaxed);
+    const auto rear = rear_.load(std::memory_order_acquire);
+    assert(rear >= front);
+    if (rear == front) {
+      return;
+    }
+    front_.store(front + 1, std::memory_order_release);
   }
 
  private:

@@ -21,8 +21,8 @@ enum class QueueStartupResult { ready, interrupted };
 // names it created; it does not exclusively own the queue shared with peers.
 // Producer API: create_shared_memory_ring_buffer, enqueue,
 // mark_producer_done, consumer_done, and readiness methods. Consumer API:
-// open_shared_memory_ring_buffer, dequeue, producer_done, mark_consumer_done,
-// and readiness
+// open_shared_memory_ring_buffer, dequeue, front, pop_front, producer_done,
+// mark_consumer_done, and readiness
 // methods. Role checks reject operations used by the wrong endpoint.
 template <typename T, std::size_t Capacity>
 class SharedLogQueueMapping {
@@ -44,6 +44,9 @@ class SharedLogQueueMapping {
   QueueStartupResult open_shared_memory_ring_buffer(int signal_fd);
   [[nodiscard]] EnqueueResult enqueue(const T& message);
   [[nodiscard]] DequeueResult dequeue(T& message);
+  [[nodiscard]] T& front();
+  [[nodiscard]] const T& front() const;
+  void pop_front();
   [[nodiscard]] std::size_t queue_size() const;
   void mark_producer_done();
   [[nodiscard]] bool producer_done() const;

@@ -200,6 +200,27 @@ DequeueResult SharedLogQueueMapping<T, Capacity>::dequeue(T& message) {
   return shared_->ring.DeQueue(message);
 }
 
+// Expose the oldest consumer-side element by reference without copying it.
+template <typename T, std::size_t Capacity>
+T& SharedLogQueueMapping<T, Capacity>::front() {
+  require_role(Role::consumer, "front");
+  return shared_->ring.front();
+}
+
+// Expose the oldest consumer-side element by const reference without copying it.
+template <typename T, std::size_t Capacity>
+const T& SharedLogQueueMapping<T, Capacity>::front() const {
+  require_role(Role::consumer, "front");
+  return shared_->ring.front();
+}
+
+// Advance past the oldest element without copying or moving its payload.
+template <typename T, std::size_t Capacity>
+void SharedLogQueueMapping<T, Capacity>::pop_front() {
+  require_role(Role::consumer, "pop front");
+  shared_->ring.pop_front();
+}
+
 // Read the current queue occupancy after verifying that a mapping is open.
 template <typename T, std::size_t Capacity>
 std::size_t SharedLogQueueMapping<T, Capacity>::queue_size() const {

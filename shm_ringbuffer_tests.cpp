@@ -99,5 +99,39 @@ int main() {
     std::cout << '\n';
   }
 
+  SpscRingBuffer<int, 4> front_and_pop_front;
+  for (int value = 1; value <= 3; ++value) {
+    if (front_and_pop_front.EnQueue(value) != EnqueueResult::enqueued) {
+      std::cerr << "Front/pop_front setup enqueue failed.\n";
+      return 1;
+    }
+  }
+
+  int& oldest = front_and_pop_front.front();
+  if (oldest != 1) {
+    std::cerr << "Front returned unexpected value.\n";
+    return 1;
+  }
+  oldest = 10;
+  if (front_and_pop_front.front() != 10) {
+    std::cerr << "Front reference did not expose the stored element.\n";
+    return 1;
+  }
+
+  front_and_pop_front.pop_front();
+  if (front_and_pop_front.Size() != 2) {
+    std::cerr << "pop_front did not remove the oldest element.\n";
+    return 1;
+  }
+
+  int first = 0;
+  int second = 0;
+  if (front_and_pop_front.DeQueue(first) != DequeueResult::dequeued ||
+      front_and_pop_front.DeQueue(second) != DequeueResult::dequeued ||
+      first != 2 || second != 3) {
+    std::cerr << "FIFO contents after pop_front are incorrect.\n";
+    return 1;
+  }
+
   return passed ? 0 : 1;
 }

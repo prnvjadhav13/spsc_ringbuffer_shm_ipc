@@ -198,15 +198,17 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
     ++event_count;
     payload_total_bytes += event.message_length;
 
-    const auto notify_result = event_notifications.notify();
-    if (!notify_result) {
-      producer_error = -notify_result.error().value();
-      break;
-    }
-
     const auto queue_size = mapping.queue_size();
     if (queue_size >= kLogQueueHighWatermark) {
       paused_for_watermark = true;
+    }
+
+    if (queue_size >= kLogQueueLowWatermark || (queue_size > 0 && mapping.check_consumer_waiting()))  {
+      const auto notify_result = event_notifications.notify();
+      if (!notify_result) {
+        producer_error = -notify_result.error().value();
+        break;
+      }
     }
   }
 

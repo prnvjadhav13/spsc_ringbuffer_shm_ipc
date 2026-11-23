@@ -49,6 +49,9 @@ class SharedLogQueueMapping {
   void pop_front();
   [[nodiscard]] std::size_t queue_size() const;
   void mark_producer_done();
+  void mark_consumer_waiting();
+  void reset_consumer_waiting();
+  [[nodiscard]] bool check_consumer_waiting() const;
   [[nodiscard]] bool producer_done() const;
   void mark_consumer_done();
   [[nodiscard]] bool consumer_done() const;

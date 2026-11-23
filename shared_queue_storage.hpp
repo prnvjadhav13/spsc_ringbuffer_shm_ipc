@@ -32,6 +32,7 @@ struct SharedQueueStorage {
   SpscRingBuffer<T, Capacity> ring;
   std::atomic<bool> producer_done{false};
   std::atomic<bool> consumer_done{false};
+  std::atomic<bool> consumer_waiting{false};
 };
 
 static_assert(std::atomic<bool>::is_always_lock_free,

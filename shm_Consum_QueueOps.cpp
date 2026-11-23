@@ -366,6 +366,7 @@ int main(int argc, char* argv[]) {
 
     while (true) {
       std::array<epoll_event, 2> ready_events{};
+      mapping.mark_consumer_waiting();
       const int ready_count =
           ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), -1);
       if (ready_count == -1) {
@@ -374,6 +375,7 @@ int main(int argc, char* argv[]) {
         }
         throw std::system_error(errno, std::generic_category(), "epoll_wait");
       }
+      mapping.reset_consumer_waiting();
 
       bool queue_notified = false;
       for (int i = 0; i < ready_count; ++i) {
@@ -399,9 +401,8 @@ int main(int argc, char* argv[]) {
         throw std::system_error(drain_result.error(), "drain queue notification");
       }
 
-      std::size_t messages_since_signal_check = 0;
-      while (mapping.queue_size() != 0) {
-        const std::size_t queue_size = mapping.queue_size();
+      while (const auto queue_size = mapping.queue_size()) {
+       // const std::size_t queue_size = mapping.queue_size();
         const LogEvent& message = mapping.front();
 
         if (message.message_length == 0 || message.message_length > kLogMessageSize) {
@@ -429,33 +430,10 @@ int main(int argc, char* argv[]) {
         }
 
         mapping.pop_front();
-
-        if (++messages_since_signal_check == kSignalCheckBatchSize) {
-          messages_since_signal_check = 0;
-          if (const auto signal = read_signal(signal_fd.get());
-              signal && received_signal == 0) {
-            received_signal = *signal;
-            break;
-          }
-        }
-      }
-
-      if (const auto signal = read_signal(signal_fd.get());
-          signal && received_signal == 0) {
-        received_signal = *signal;
-      }
-
-      if (received_signal != 0) {
-        ring_drain_end = std::chrono::steady_clock::now();
-        break;
       }
 
       if (mapping.producer_done() && mapping.queue_size() == 0) {
         ring_drain_end = std::chrono::steady_clock::now();
-        if (const auto signal = read_signal(signal_fd.get());
-            signal && received_signal == 0) {
-          received_signal = *signal;
-        }
         mapping.mark_consumer_done();
         const auto notify_result = notify_eventfd(notification_fds.space_available.get());
         if (!notify_result) {

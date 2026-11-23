@@ -258,6 +258,27 @@ bool SharedLogQueueMapping<T, Capacity>::consumer_done() const {
   return shared_->consumer_done.load(std::memory_order_acquire);
 }
 
+// Publish consumer waiting state with release ordering for the consumer to observe.
+template <typename T, std::size_t Capacity>
+void SharedLogQueueMapping<T, Capacity>::mark_consumer_waiting() {
+  require_role(Role::consumer, "mark consumer waiting");
+  shared_->consumer_waiting.store(true, std::memory_order_release);
+}
+
+// Reset consumer waiting state with release ordering for the consumer to observe.
+template <typename T, std::size_t Capacity>
+void SharedLogQueueMapping<T, Capacity>::reset_consumer_waiting() {
+  require_role(Role::consumer, "reset consumer waiting");
+  shared_->consumer_waiting.store(false, std::memory_order_release);
+}
+
+// Read consumer waiting state after verifying the producer mapping is open.
+template <typename T, std::size_t Capacity>
+bool SharedLogQueueMapping<T, Capacity>::check_consumer_waiting() const {
+  require_role(Role::producer, "read consumer waiting state");
+  return shared_->consumer_waiting.load(std::memory_order_acquire);
+}
+
 // Publish producer readiness by posting the initialization semaphore.
 template <typename T, std::size_t Capacity>
 void SharedLogQueueMapping<T, Capacity>::post_ready() const {

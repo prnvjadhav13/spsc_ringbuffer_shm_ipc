@@ -132,7 +132,7 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
 
     std::array<epoll_event, 2> ready_events{};
     const int ready_count = ::epoll_wait(
-        epoll_fd.get(), ready_events.data(), ready_events.size(), paused_for_watermark ? -1 : 0);
+        epoll_fd.get(), ready_events.data(), ready_events.size(), (paused_for_watermark) ? -1 : 0);
     if (ready_count == -1) {
       if (errno == EINTR) {
         continue;
@@ -184,6 +184,12 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
       continue;
     }
 
+    int batch_count = kLogQueueBatchSize;
+
+    for (int i = 0; i < batch_count && event_count < options.messages; ++i) {
+      if ((producer_error = server_error.load()) != 0) {
+        break;
+      }
     LogEvent event{};
     event.LogEventId = event_count + 1;
     const std::size_t payload_bytes =
@@ -192,23 +198,22 @@ int produce_messages(SharedLogQueueMapping<LogEvent, kLogQueueCapacity>& mapping
 
     if (mapping.enqueue(event) == EnqueueResult::full) {
       paused_for_watermark = true;
-      continue;
+      break;
     }
 
     ++event_count;
     payload_total_bytes += event.message_length;
+  }
 
     const auto queue_size = mapping.queue_size();
-    if (queue_size >= kLogQueueHighWatermark) {
+    if (!paused_for_watermark && queue_size >= kLogQueueHighWatermark) {
       paused_for_watermark = true;
     }
 
-    if (queue_size >= kLogQueueLowWatermark || (queue_size > 0 && mapping.check_consumer_waiting()))  {
-      const auto notify_result = event_notifications.notify();
-      if (!notify_result) {
+    const auto notify_result = event_notifications.notify();
+    if (!notify_result) {
         producer_error = -notify_result.error().value();
         break;
-      }
     }
   }
 

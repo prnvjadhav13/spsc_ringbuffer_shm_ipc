@@ -19,6 +19,7 @@ inline constexpr std::size_t kLogQueueHighWatermark =
     (kLogQueueCapacity * 90) / 100;
 inline constexpr std::size_t kLogQueueLowWatermark =
     (kLogQueueCapacity * 40) / 100;
+    inline constexpr std::size_t kLogQueueBatchSize = kLogQueueCapacity / 4;
 inline constexpr std::size_t kDefaultTransferMessages = 1'000;
 
 inline constexpr std::size_t kMinimumPayloadBytes = 1024;

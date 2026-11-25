@@ -363,12 +363,21 @@ int main(int argc, char* argv[]) {
     std::uint64_t payload_total_bytes = 0;
     int received_signal = 0;
     std::chrono::steady_clock::time_point ring_drain_end;
+    bool paused_for_queue_empty = false;
+    bool low_watermark_notified = false;
 
     while (true) {
       std::array<epoll_event, 2> ready_events{};
-      mapping.mark_consumer_waiting();
+      const auto queue_size = mapping.queue_size();
+      if (queue_size == 0) {
+        paused_for_queue_empty = true;
+        mapping.mark_consumer_waiting();
+      } else {
+        paused_for_queue_empty = false;
+      }
+
       const int ready_count =
-          ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), -1);
+          ::epoll_wait(epoll_fd.get(), ready_events.data(), ready_events.size(), paused_for_queue_empty ? -1 : 0);
       if (ready_count == -1) {
         if (errno == EINTR) {
           continue;
@@ -419,17 +428,26 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Payload writer queue closed before transfer completed");
           }
         }
+        mapping.pop_front();
 
-        if (queue_size != 0 && queue_size <= kLogQueueLowWatermark) {
-          const auto notify_result = notify_eventfd(notification_fds.space_available.get());
+        const auto remaining_size = mapping.queue_size();
+
+        if (queue_size > kLogQueueLowWatermark) {
+          low_watermark_notified = false;  // Re-arm after occupancy rises above the watermark.
+        }
+
+        if (!low_watermark_notified &&
+            queue_size > kLogQueueLowWatermark &&
+            remaining_size <= kLogQueueLowWatermark) {
+          const auto notify_result =
+              notify_eventfd(notification_fds.space_available.get());
           if (!notify_result) {
             std::cerr << "Space-available notification failed: "
                       << notify_result.error().message() << ".\n";
             output_ok.store(false, std::memory_order_relaxed);
           }
+          low_watermark_notified = true;
         }
-
-        mapping.pop_front();
       }
 
       if (mapping.producer_done() && mapping.queue_size() == 0) {

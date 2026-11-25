@@ -13,8 +13,11 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent
 PRODUCER = ROOT / "build" / "release" / "producer"
 CONSUMER = ROOT / "build" / "release" / "consumer"
-PAYLOAD_SIZES = (64, 256, 1024, 2024)
-MESSAGE_COUNT = int(os.environ.get("SPSC_IPC_TEST_MESSAGES", "20000"))
+PAYLOAD_SIZES = tuple(
+    int(size)
+    for size in os.environ.get("SPSC_IPC_TEST_PAYLOAD_SIZES", "64,256,1024,2024").split(",")
+)
+MESSAGE_COUNT = int(os.environ.get("SPSC_IPC_TEST_MESSAGES", "100000"))
 PROC_TICKS_PER_SECOND = os.sysconf("SC_CLK_TCK")
 SUMMARY_PATTERN = re.compile(r"^  ([a-z0-9_]+)=([^\n]+)$", re.MULTILINE)
 
@@ -108,10 +111,14 @@ class ProcessMonitor:
 
     def _run(self):
         previous_time = time.monotonic()
-        while not self._stop.wait(self.interval_seconds):
+        while True:
             now = time.monotonic()
             self._sample(now, previous_time)
             previous_time = now
+            if self._stop.wait(self.interval_seconds):
+                now = time.monotonic()
+                self._sample(now, previous_time)
+                break
 
     def metrics(self):
         wall_seconds = max(0.0, self._finished_at - self._started_at)
